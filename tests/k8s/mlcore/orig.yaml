@@ -1,0 +1,379 @@
+---
+# Source: daos-csi-driver/templates/attacher.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: daos-csi-driver-attacher-sa
+  namespace: dcd
+---
+# Source: daos-csi-driver/templates/rbac.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: daos-csi-driver-sa
+  namespace: dcd
+---
+# Source: daos-csi-driver/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: daos-csi-driver-config
+  namespace: dcd
+data:
+  driver_config.yaml: |
+    telemetry:
+      logger:
+        SageSystem: data-proxy
+        ServiceName: daos-csi-driver
+        SageGroup: ml_platform_core
+        K8sCluster: lab
+        AppVersion: MLCORE_TAG
+        Logger:
+          Level: debug
+      tracing:
+        TenantName: default
+        ServiceName: daos-csi-driver
+        SageSystem: data-proxy
+        SageGroup: ml_platform_core
+        K8sCluster: lab
+        K8sNamespace: dcd
+        AppEnv: dev
+        AppVersion: MLCORE_TAG
+        Tracer:
+          CollectorEndpoint: "collector.dtracing.dev-tcsgroup.io"
+          SampleRatio: 1
+      metrics:
+        path: /metrics
+        endpoint: :61111
+        env: dev
+        namespace: daos_driver
+        version: MLCORE_TAG
+      pprof:
+        enable: false
+        port: 6062
+    
+    health:
+      port: 65080
+      livenessPath: /healthz
+      readinessPath: /readyz
+    
+    csi:
+      endpoint: "unix:///csi/csi.sock"
+      driverName: mlcore.daos.csi
+      nodeId: "$NODE_ID"
+    
+    dfuse:
+      cliPath: /opt/daos/bin
+      mountDirPermission: "0777"
+---
+# Source: daos-csi-driver/templates/storageclass.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: daos-storage-class
+provisioner: mlcore.daos.csi
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+---
+# Source: daos-csi-driver/templates/attacher.yaml
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: daos-csi-driver-attacher-role
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments/status"]
+    verbs: ["patch"]
+---
+# Source: daos-csi-driver/templates/rbac.yaml
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: daos-csi-driver-role
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "update"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch", "update"]
+---
+# Source: daos-csi-driver/templates/attacher.yaml
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: daos-csi-driver-attacher-rolebind
+subjects:
+  - kind: ServiceAccount
+    name: daos-csi-driver-attacher-sa
+    namespace: dcd
+roleRef:
+  kind: ClusterRole
+  name: daos-csi-driver-attacher-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# Source: daos-csi-driver/templates/rbac.yaml
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: daos-csi-driver-rolebind
+subjects:
+  - kind: ServiceAccount
+    name: daos-csi-driver-sa
+    namespace: dcd
+roleRef:
+  kind: ClusterRole
+  name: daos-csi-driver-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# Source: daos-csi-driver/templates/attacher.yaml
+# needed for StatefulSet
+kind: Service
+apiVersion: v1
+metadata:
+  name: daos-csi-driver-attacher-svc
+  namespace: dcd
+  labels:
+    app: daos-csi-driver-attacher
+    release: daos-csi-driver
+spec:
+  selector:
+    app: daos-csi-driver-attacher
+    release: daos-csi-driver
+  ports:
+    - name: csi-daos-dummy
+      port: 65535
+---
+# Source: daos-csi-driver/templates/driver.yaml
+kind: DaemonSet
+apiVersion: apps/v1
+metadata:
+  name: daos-csi-driver
+  namespace: dcd
+  labels:
+    app: daos-csi-driver
+    release: daos-csi-driver
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 50%
+  selector:
+    matchLabels:
+      app: daos-csi-driver
+      release: daos-csi-driver
+  template:
+    metadata:
+      labels:
+        app: daos-csi-driver
+        release: daos-csi-driver
+      annotations:
+        sage/group: ml_platform_core
+        ml-core/system: "data-proxy"
+        ml-core/service_name: "daos-csi-driver"
+        ml-core/logs: enabled
+        ml-core/env: "dev"
+        app.kubernetes.io/component: daos-csi-driver
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "61111"
+    spec:
+      hostNetwork: true
+      hostPID: true
+      imagePullSecrets:
+        - name: artifactory-cred-secret
+      tolerations:
+      serviceAccount: daos-csi-driver-sa
+      containers:
+        - name: driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.6.2
+          imagePullPolicy: Always
+          args:
+            - "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)"
+            - "--v=4"
+            - "--csi-address=$(ADDRESS)"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+            - name: DRIVER_REG_SOCK_PATH
+              value: /var/lib/kubelet/plugins/mlcore.daos.csi/csi.sock
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration/
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+        - name: driver
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN"]
+            allowPrivilegeEscalation: true
+          image: MLCORE_REPO:MLCORE_TAG
+          imagePullPolicy: Always
+          command: [ "/app/daos-driver" ]
+          args:
+            - -config
+            - /etc/config/driver_config.yaml
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 65080
+              scheme: HTTP
+            initialDelaySeconds: 25
+            periodSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 65080
+              scheme: HTTP
+            initialDelaySeconds: 25
+            periodSeconds: 5
+          ports:
+            - containerPort: 6062
+            - containerPort: 61111
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: pods-mount-dir
+              mountPath: /var/lib/kubelet/pods
+              mountPropagation: "Bidirectional"
+            - mountPath: /etc/config
+              name: driver-config
+              readOnly: true
+            - name: daos-sock
+              mountPath: /var/run/daos_agent
+              readOnly: true
+          resources: 
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 512Mi
+      volumes:
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry/
+            type: DirectoryOrCreate
+        - name: plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/mlcore.daos.csi
+            type: DirectoryOrCreate
+        - name: pods-mount-dir
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
+        - name: driver-config
+          configMap:
+            name: daos-csi-driver-config
+        - name: daos-sock
+          hostPath:
+            path: /var/run/daos_agent
+            type: DirectoryOrCreate
+---
+# Source: daos-csi-driver/templates/attacher.yaml
+kind: StatefulSet
+apiVersion: apps/v1
+metadata:
+  name: daos-csi-driver-attacher
+  namespace: dcd
+  labels:
+    app: daos-csi-driver-attacher
+    release: daos-csi-driver
+spec:
+  serviceName: daos-csi-driver-attacher-svc
+  replicas: 1
+  selector:
+    matchLabels:
+      app: daos-csi-driver-attacher
+      release: daos-csi-driver
+  template:
+    metadata:
+      labels:
+        app: daos-csi-driver-attacher
+        release: daos-csi-driver
+      annotations:
+        app.kubernetes.io/component: daos-csi-driver
+    spec:
+      serviceAccount: daos-csi-driver-attacher-sa
+      tolerations:
+      affinity:
+      imagePullSecrets:
+        - name: artifactory-cred-secret
+      containers:
+        - name: csi-attacher
+          image: registry.k8s.io/sig-storage/csi-attacher:v4.0.0
+          args:
+            - "--v=4"
+            - "--csi-address=$(ADDRESS)"
+          env:
+            - name: ADDRESS
+              value: /var/lib/kubelet/plugins/mlcore.daos.csi/csi.sock
+          imagePullPolicy: Always
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/lib/kubelet/plugins/mlcore.daos.csi
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/mlcore.daos.csi
+            type: DirectoryOrCreate

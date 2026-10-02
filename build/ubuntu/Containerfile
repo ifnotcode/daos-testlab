@@ -1,0 +1,39 @@
+# DAOS for Ubuntu 22.04 / 24.04, built the way https://docs.daos.io/latest/QSG/build_from_scratch/
+# describes: install-ubuntu.sh, a venv with requirements-build.txt, then
+# scons --config=force --build-deps=yes install (PREFIX=/opt/daos). SCONS_TARGETS="client install"
+# builds only the client and the dependencies it needs (docs/dev/development.md, "Custom build
+# targets"): no server, SPDK, PMDK or test programs.
+# Build context: ./daos, a DAOS source tree with its submodules and the patch set applied.
+# The only deviation from the QSG: Go from go.dev (go.mod needs >= 1.21, Ubuntu 22.04 has 1.18).
+# Result: /out/daos-<version>-<name>-<distro>-x86_64.tar.gz with the /opt/daos install tree.
+ARG BASE_IMAGE=docker.io/library/ubuntu:22.04
+FROM ${BASE_IMAGE}
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git sudo && \
+    rm -rf /var/lib/apt/lists/*
+# QSG: sudo ./utils/scripts/install-ubuntu.sh
+COPY daos/utils/scripts/install-ubuntu.sh /tmp/install-ubuntu.sh
+RUN apt-get update && bash /tmp/install-ubuntu.sh -y && rm -rf /var/lib/apt/lists/*
+
+ARG GO_VERSION=1.25.14
+RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz | tar -C /usr/local -xz
+ENV PATH=/usr/local/go/bin:$PATH GOTOOLCHAIN=local
+
+WORKDIR /build/daos
+COPY daos/ ./
+# QSG: python virtual environment
+RUN python3 -m venv venv && . venv/bin/activate && \
+    python3 -m pip --no-cache-dir install --upgrade pip && \
+    python3 -m pip --no-cache-dir install -r requirements-build.txt
+# QSG: scons --jobs $(nproc) --config=force --build-deps=yes install
+ARG JOBS=8
+ARG SCONS_TARGETS=install
+RUN . venv/bin/activate && \
+    scons --jobs ${JOBS} --config=force --build-deps=yes ${SCONS_TARGETS} PREFIX=/opt/daos
+
+ARG DISTRO=ubuntu22.04
+ARG NAME=build
+RUN mkdir -p /out && \
+    tar -C / -czf /out/daos-$(cat VERSION)-${NAME}-${DISTRO}-x86_64.tar.gz opt/daos && \
+    ls -la /out

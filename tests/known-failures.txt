@@ -1,0 +1,15 @@
+# Known failures that are not the fault of what is tested: "<suite> <test> <status> <reason>".
+# A suite reports such a test as expected, so that nobody looks into it again. If it passes one
+# day, the suite reports "expected FAIL, got PASS": then drop the line. Details, with the evidence
+# (A/B runs on a build without the patch), are in
+# /Users/Dmitry/Documents/Claude/DaosInmapPatch/KNOWN-ISSUES.md.
+
+# upstream: bash 5.1 under libpil4dfs, "xrealloc: cannot allocate 4294967464 bytes" (fd 0x20000014);
+# also on master 0dbc4dd without the patch, kernels 5.14 and 7.2
+ftest DFuseFdTest.test_bashfd_pil4dfs FAIL upstream: bash 5.1 under libpil4dfs, xrealloc of 4 GiB
+# upstream: the libaio fio step under libpil4dfs asserts in pil4dfs/aio.c:78; also without the patch
+ftest DfuseBashCmd.test_bashcmd_pil4dfs FAIL upstream: fio libaio under libpil4dfs, aio.c:78 assertion
+ftest DfuseBashCmd.test_bashcmd_pil4dfs_nobypass FAIL upstream: fio libaio under libpil4dfs, aio.c:78 assertion
+# lab: the test ends with a curl of a host on HPE's CI network; all file system steps pass
+ftest DfuseBashCmd.test_bashcmd FAIL lab: curl of jenkins.daos.hpc.amslabs.hpecorp.net (CI network)
+ftest DfuseBashCmd.test_bashcmd_ioil FAIL lab: curl of jenkins.daos.hpc.amslabs.hpecorp.net (CI network)

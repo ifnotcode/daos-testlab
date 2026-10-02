@@ -1,0 +1,336 @@
+From 65d8696582fef436493137b9aba0b9105ac3107a Mon Sep 17 00:00:00 2001
+From: Dmitry Polonsky <ifnotelse@gmail.com>
+Date: Sat, 26 Sep 2026 20:46:53 +0300
+Subject: [PATCH 2/2] build: Use fused v1.1.0 with FUSE_CAP_ALLOW_IDMAP (DAOS
+ 2.8.0)
+
+fused v1.1.0 (libfuse 3.17.4) plus the libfuse FUSE_CAP_ALLOW_IDMAP backport carried in deps/patches/fused, as in the DAOS master build PR, for a 2.8.0 client with dfuse --allow-idmap.
+---
+ .../fused/0001_fuse_kernel_h_linux_6.14.patch | 186 ++++++++++++++++++
+ .../fused/0002_fuse_cap_allow_idmap.patch     |  83 ++++++++
+ utils/build.config                            |   3 +-
+ utils/rpms/package_info.sh                    |   4 +-
+ 4 files changed, 273 insertions(+), 3 deletions(-)
+ create mode 100644 deps/patches/fused/0001_fuse_kernel_h_linux_6.14.patch
+ create mode 100644 deps/patches/fused/0002_fuse_cap_allow_idmap.patch
+
+diff --git a/deps/patches/fused/0001_fuse_kernel_h_linux_6.14.patch b/deps/patches/fused/0001_fuse_kernel_h_linux_6.14.patch
+new file mode 100644
+index 0000000..b03f0ee
+--- /dev/null
++++ b/deps/patches/fused/0001_fuse_kernel_h_linux_6.14.patch
+@@ -0,0 +1,186 @@
++From 3cfc16cb819aca18f4d54d4414a78f37ddd2b232 Mon Sep 17 00:00:00 2001
++From: Bernd Schubert <bschubert@ddn.com>
++Date: Mon, 24 Mar 2025 17:53:01 +0100
++Subject: [PATCH 1/2] Synchronize fuse_kernel.h with linux-6.14
++
++Also add FUSE_CAP_OVER_IO_URING
++
++Signed-off-by: Bernd Schubert <bschubert@ddn.com>
++(cherry picked from commit d393ffa85b0926374c8df543a9ffc81b1d0ce232)
++---
++ include/fuse_common.h |  7 +++-
++ include/fuse_kernel.h | 96 ++++++++++++++++++++++++++++++++++++++++++-
++ 2 files changed, 101 insertions(+), 2 deletions(-)
++
++diff --git a/include/fuse_common.h b/include/fuse_common.h
++index f9689907..7e53483f 100644
++--- a/include/fuse_common.h
+++++ b/include/fuse_common.h
++@@ -7,7 +7,6 @@
++ 
++ /** @file */
++ 
++-#include <stdbool.h>
++ #if !defined(FUSE_H_) && !defined(FUSE_LOWLEVEL_H_)
++ #error "Never include <fuse_common.h> directly; use <fuse.h> or <fuse_lowlevel.h> instead."
++ #endif
++@@ -24,6 +23,7 @@
++ #include "fuse_opt.h"
++ #include "fuse_log.h"
++ #include <stdint.h>
+++#include <stdbool.h>
++ #include <sys/types.h>
++ #include <assert.h>
++ 
++@@ -507,6 +507,11 @@ struct fuse_loop_config_v1 {
++  */
++ #define FUSE_CAP_NO_EXPORT_SUPPORT (1 << 30)
++ 
+++/**
+++ * Indicates support for io-uring between fuse-server and fuse-client
+++ */
+++#define FUSE_CAP_OVER_IO_URING (1 << 31)
+++
++ /**
++  * Ioctl flags
++  *
++diff --git a/include/fuse_kernel.h b/include/fuse_kernel.h
++index d08b99d6..5e0eb41d 100644
++--- a/include/fuse_kernel.h
+++++ b/include/fuse_kernel.h
++@@ -217,6 +217,18 @@
++  *  - add backing_id to fuse_open_out, add FOPEN_PASSTHROUGH open flag
++  *  - add FUSE_NO_EXPORT_SUPPORT init flag
++  *  - add FUSE_NOTIFY_RESEND, add FUSE_HAS_RESEND init flag
+++ *
+++ *  7.41
+++ *  - add FUSE_ALLOW_IDMAP
+++ *  7.42
+++ *  - Add FUSE_OVER_IO_URING and all other io-uring related flags and data
+++ *    structures:
+++ *    - struct fuse_uring_ent_in_out
+++ *    - struct fuse_uring_req_header
+++ *    - struct fuse_uring_cmd_req
+++ *    - FUSE_URING_IN_OUT_HEADER_SZ
+++ *    - FUSE_URING_OP_IN_OUT_SZ
+++ *    - enum fuse_uring_cmd
++  */
++ 
++ #ifndef _LINUX_FUSE_H
++@@ -252,7 +264,7 @@
++ #define FUSE_KERNEL_VERSION 7
++ 
++ /** Minor version number of this interface */
++-#define FUSE_KERNEL_MINOR_VERSION 40
+++#define FUSE_KERNEL_MINOR_VERSION 42
++ 
++ /** The node ID of the root inode */
++ #define FUSE_ROOT_ID 1
++@@ -421,6 +433,8 @@ struct fuse_file_lock {
++  * FUSE_NO_EXPORT_SUPPORT: explicitly disable export support
++  * FUSE_HAS_RESEND: kernel supports resending pending requests, and the high bit
++  *		    of the request ID indicates resend requests
+++ * FUSE_ALLOW_IDMAP: allow creation of idmapped mounts
+++ * FUSE_OVER_IO_URING: Indicate that client supports io-uring
++  */
++ #define FUSE_ASYNC_READ		(1 << 0)
++ #define FUSE_POSIX_LOCKS	(1 << 1)
++@@ -466,6 +480,8 @@ struct fuse_file_lock {
++ 
++ /* Obsolete alias for FUSE_DIRECT_IO_ALLOW_MMAP */
++ #define FUSE_DIRECT_IO_RELAX	FUSE_DIRECT_IO_ALLOW_MMAP
+++#define FUSE_ALLOW_IDMAP	(1ULL << 40)
+++#define FUSE_OVER_IO_URING	(1ULL << 41)
++ 
++ /**
++  * CUSE INIT request/reply flags
++@@ -984,6 +1000,21 @@ struct fuse_fallocate_in {
++  */
++ #define FUSE_UNIQUE_RESEND (1ULL << 63)
++ 
+++/**
+++ * This value will be set by the kernel to
+++ * (struct fuse_in_header).{uid,gid} fields in
+++ * case when:
+++ * - fuse daemon enabled FUSE_ALLOW_IDMAP
+++ * - idmapping information is not available and uid/gid
+++ *   can not be mapped in accordance with an idmapping.
+++ *
+++ * Note: an idmapping information always available
+++ * for inode creation operations like:
+++ * FUSE_MKNOD, FUSE_SYMLINK, FUSE_MKDIR, FUSE_TMPFILE,
+++ * FUSE_CREATE and FUSE_RENAME2 (with RENAME_WHITEOUT).
+++ */
+++#define FUSE_INVALID_UIDGID ((uint32_t)(-1))
+++
++ struct fuse_in_header {
++ 	uint32_t	len;
++ 	uint32_t	opcode;
++@@ -1186,4 +1217,67 @@ struct fuse_supp_groups {
++ 	uint32_t	groups[];
++ };
++ 
+++/**
+++ * Size of the ring buffer header
+++ */
+++#define FUSE_URING_IN_OUT_HEADER_SZ 128
+++#define FUSE_URING_OP_IN_OUT_SZ 128
+++
+++/* Used as part of the fuse_uring_req_header */
+++struct fuse_uring_ent_in_out {
+++	uint64_t flags;
+++
+++	/*
+++	 * commit ID to be used in a reply to a ring request (see also
+++	 * struct fuse_uring_cmd_req)
+++	 */
+++	uint64_t commit_id;
+++
+++	/* size of user payload buffer */
+++	uint32_t payload_sz;
+++	uint32_t padding;
+++
+++	uint64_t reserved;
+++};
+++
+++/**
+++ * Header for all fuse-io-uring requests
+++ */
+++struct fuse_uring_req_header {
+++	/* struct fuse_in_header / struct fuse_out_header */
+++	char in_out[FUSE_URING_IN_OUT_HEADER_SZ];
+++
+++	/* per op code header */
+++	char op_in[FUSE_URING_OP_IN_OUT_SZ];
+++
+++	struct fuse_uring_ent_in_out ring_ent_in_out;
+++};
+++
+++/**
+++ * sqe commands to the kernel
+++ */
+++enum fuse_uring_cmd {
+++	FUSE_IO_URING_CMD_INVALID = 0,
+++
+++	/* register the request buffer and fetch a fuse request */
+++	FUSE_IO_URING_CMD_REGISTER = 1,
+++
+++	/* commit fuse request result and fetch next request */
+++	FUSE_IO_URING_CMD_COMMIT_AND_FETCH = 2,
+++};
+++
+++/**
+++ * In the 80B command area of the SQE.
+++ */
+++struct fuse_uring_cmd_req {
+++	uint64_t flags;
+++
+++	/* entry identifier for commits */
+++	uint64_t commit_id;
+++
+++	/* queue the command is for (queue index) */
+++	uint16_t qid;
+++	uint8_t padding[6];
+++};
+++
++ #endif /* _LINUX_FUSE_H */
+diff --git a/deps/patches/fused/0002_fuse_cap_allow_idmap.patch b/deps/patches/fused/0002_fuse_cap_allow_idmap.patch
+new file mode 100644
+index 0000000..5dec693
+--- /dev/null
++++ b/deps/patches/fused/0002_fuse_cap_allow_idmap.patch
+@@ -0,0 +1,83 @@
++From 1edc31599ebea58f28a9b289c2656739f51fe992 Mon Sep 17 00:00:00 2001
++From: Renzheng Wang <renzheng.wang@ucloud.cn>
++Date: Sun, 15 Mar 2026 19:55:32 +0800
++Subject: [PATCH 2/2] add FUSE_CAP_ALLOW_IDMAP (#1446)
++
++* fuse: add FUSE_CAP_ALLOW_IDMAP support
++
++Add FUSE_CAP_ALLOW_IDMAP capability flag to indicate that creation of
++idmapped mounts is allowed. This maps to the kernel's FUSE_ALLOW_IDMAP
++flag.
++
++- Define FUSE_CAP_ALLOW_IDMAP in fuse_common.h using (1ULL << 32) to
++  ensure correct behavior on both 32-bit and 64-bit platforms.
++- Set the capability in capable_ext when kernel reports FUSE_ALLOW_IDMAP.
++- Send FUSE_ALLOW_IDMAP to kernel when userspace sets it in want_ext.
++- Add the new FUSE_CAP_ALLOW_IDMAP capability to the printcap example
++so it is printed when supported by the kernel.
++
++Signed-off-by: Renzheng Wang <wangrzneu@gmail.com>
++
++[Backported to libfuse 3.17.4 (fused v1.1.0): the context of both lib/fuse_lowlevel.c hunks
++differs. The FUSE_CAP_OVER_IO_URING lines around the first hunk are not part of this change and
++were left out (3.17 has no io-uring support); the second hunk is placed before FUSE_INIT_EXT is
++handled, as upstream, so that the flag reaches flags2.]
++
++(cherry picked from commit 1f4c0608e7c6202f88db791c19cc4bfe60d40edd)
++---
++ example/printcap.c    | 1 +
++ include/fuse_common.h | 5 +++++
++ lib/fuse_lowlevel.c   | 5 +++++
++ 3 files changed, 11 insertions(+)
++
++diff --git a/example/printcap.c b/example/printcap.c
++index 74d22e1c..69827778 100644
++--- a/example/printcap.c
+++++ b/example/printcap.c
++@@ -65,6 +65,7 @@ static const struct cap_info capabilities[] = {
++     {FUSE_CAP_DIRECT_IO_ALLOW_MMAP,	"FUSE_CAP_DIRECT_IO_ALLOW_MMAP"},
++     {FUSE_CAP_NO_EXPORT_SUPPORT,	"FUSE_CAP_NO_EXPORT_SUPPORT"},
++     {FUSE_CAP_PASSTHROUGH,		"FUSE_CAP_PASSTHROUGH"},
+++    {FUSE_CAP_ALLOW_IDMAP,		"FUSE_CAP_ALLOW_IDMAP"},
++     // Add any new capabilities here
++     {0, NULL} // Sentinel to mark the end of the array
++ };
++diff --git a/include/fuse_common.h b/include/fuse_common.h
++index 7e53483f..2e441b8d 100644
++--- a/include/fuse_common.h
+++++ b/include/fuse_common.h
++@@ -512,6 +512,11 @@ struct fuse_loop_config_v1 {
++  */
++ #define FUSE_CAP_OVER_IO_URING (1 << 31)
++ 
+++/**
+++ * Indicates that creation of idmapped mounts is allowed
+++ */
+++#define FUSE_CAP_ALLOW_IDMAP (1ULL << 32)
+++
++ /**
++  * Ioctl flags
++  *
++diff --git a/lib/fuse_lowlevel.c b/lib/fuse_lowlevel.c
++index 2164ba5b..63a7ff5f 100644
++--- a/lib/fuse_lowlevel.c
+++++ b/lib/fuse_lowlevel.c
++@@ -2172,6 +2172,8 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
++ 			se->conn.capable_ext |= FUSE_CAP_PASSTHROUGH;
++ 		if (inargflags & FUSE_NO_EXPORT_SUPPORT)
++ 			se->conn.capable_ext |= FUSE_CAP_NO_EXPORT_SUPPORT;
+++		if (inargflags & FUSE_ALLOW_IDMAP)
+++			se->conn.capable_ext |= FUSE_CAP_ALLOW_IDMAP;
++ 	} else {
++ 		se->conn.max_readahead = 0;
++ 	}
++@@ -2326,6 +2328,9 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
++ 	if (se->conn.want_ext & FUSE_CAP_NO_EXPORT_SUPPORT)
++ 		outargflags |= FUSE_NO_EXPORT_SUPPORT;
++ 
+++	if (se->conn.want_ext & FUSE_CAP_ALLOW_IDMAP)
+++		outargflags |= FUSE_ALLOW_IDMAP;
+++
++ 	if (inargflags & FUSE_INIT_EXT) {
++ 		outargflags |= FUSE_INIT_EXT;
++ 		outarg.flags2 = outargflags >> 32;
+diff --git a/utils/build.config b/utils/build.config
+index 4de7319..53bec75 100644
+--- a/utils/build.config
++++ b/utils/build.config
+@@ -3,7 +3,7 @@ component=daos
+ 
+ [commit_versions]
+ argobots=v1.2
+-fused=v1.0.0
++fused=v1.1.0
+ pmdk=2.1.3
+ isal=v2.31.1
+ isal_crypto=v2.26
+@@ -26,6 +26,7 @@ protobufc=https://github.com/protobuf-c/protobuf-c.git
+ ucx=https://github.com/openucx/ucx.git
+ 
+ [patch_versions]
++fused=0001_fuse_kernel_h_linux_6.14.patch,0002_fuse_cap_allow_idmap.patch
+ spdk=0001_external_isal_v26.01.patch
+ mercury=0001_dep_versions.patch,0002_ofi_counters.patch,0003_ofi_auth_key.patch,0004_ucx_connection_reset.patch,0005_ucx_put_flush.patch
+ pmdk=https://github.com/daos-stack/pmdk/commit/bb048d67ccd07609f86a5e8b3c6ad54414d593ee.diff,https://github.com/daos-stack/pmdk/commit/69925cf455ef672c4cbdbdb13bef7ae581e67045.diff,https://github.com/daos-stack/pmdk/commit/6805ed4f8d1a4e4c6070bf8b68f0dffef08b9c99.diff
+diff --git a/utils/rpms/package_info.sh b/utils/rpms/package_info.sh
+index a2bb6ef..e9634bc 100644
+--- a/utils/rpms/package_info.sh
++++ b/utils/rpms/package_info.sh
+@@ -63,8 +63,8 @@ export spdk_major_version="26.01"
+ export daos_spdk_version=${spdk_major_version}
+ export daos_spdk_release="2${distro_name}"
+ export daos_spdk_full="${daos_spdk_version}-${daos_spdk_release}"
+-export fused_version="1.0.0"
+-export fused_release="3${distro_name}"
++export fused_version="1.1.0"
++export fused_release="1${distro_name}"
+ export fused_full="${fused_version}-${fused_release}"
+ 
+ set_lib_name openmpi lib openmpi openmpi3 openmpi
+-- 
+2.39.5 (Apple Git-154)
+

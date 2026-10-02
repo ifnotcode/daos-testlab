@@ -1,0 +1,5 @@
+# single node: workloads run on the control plane
+apiVersion: v1alpha1
+kind: KubeNodeConfig
+taints:
+  $patch: delete

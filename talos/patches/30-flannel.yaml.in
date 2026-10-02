@@ -1,0 +1,6 @@
+# DAOS servers reply to client pod IPs: do not masquerade pod traffic (the server routes the pod
+# CIDR back to this node)
+apiVersion: v1alpha1
+kind: KubeFlannelCNIConfig
+extraArgs:
+  - --ip-masq=false

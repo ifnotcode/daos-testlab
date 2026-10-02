@@ -1,0 +1,740 @@
+From 3692b635678ec1c66f63f320cce39f88126933b7 Mon Sep 17 00:00:00 2001
+From: Dmitry Polonsky <ifnotelse@gmail.com>
+Date: Mon, 28 Sep 2026 17:48:59 +0000
+Subject: [PATCH] DAOS-XXXXX dfs: Return scan statistics and scan
+ subdirectories
+
+daos fs scan walks a POSIX container and reports how many files,
+directories and symlinks it has and how many bytes its files hold. The
+statistics are only printed to stdout by libdfs, so neither applications
+nor the daos tool can use them, and --dir-name is accepted but ignored:
+the scan always starts from the root (a TODO in dfs_cont_scan()).
+
+Add dfs_scan(), which walks the tree under an open directory of a mounted
+DFS and returns the statistics in a dfs_scan_stats_t. Progress is printed
+only with DFS_SCAN_PRINT_PROGRESS. dfs_cont_scan() keeps its signature and
+output, now uses dfs_scan() and honors the subdirectory, with or without
+a leading /.
+
+daos fs scan now calls dfs_scan() through fs_scan_hdlr(), so --dir-name
+works, and supports -j. It opens the container read-only as the other
+fs commands do, and its text output is unchanged.
+
+Add a DFS unit test and document the command.
+
+Features: dfs
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01EXq8AdVE9d17tb92rLDTDR
+---
+ docs/user/filesystem.md            |  17 +++
+ src/client/dfs/cont.c              | 216 +++++++++++++++++------------
+ src/control/cmd/daos/filesystem.go |  63 +++++++--
+ src/include/daos_fs.h              |  44 +++++-
+ src/tests/suite/dfs_unit_test.c    | 135 ++++++++++++++++++
+ src/utils/daos_dfs_hdlr.c          |  47 +++++++
+ src/utils/daos_hdlr.h              |   2 +
+ 7 files changed, 429 insertions(+), 95 deletions(-)
+
+diff --git a/docs/user/filesystem.md b/docs/user/filesystem.md
+index 77459efd1..75af3ed7d 100644
+--- a/docs/user/filesystem.md
++++ b/docs/user/filesystem.md
+@@ -122,6 +122,23 @@ Other consistency issues are handled differently between the two consistency mod
+   should be visible to another client with a simple coordination between the
+   clients.
+ 
++### Namespace Statistics
++
++`daos fs scan` walks the namespace of a POSIX container and reports the number
++of files, directories and symbolic links, the depth of the tree, the largest
++file and directory, and the total size of the files. `--dir-name` limits the
++scan to a subdirectory, and `-j` prints the result as JSON:
++
++```bash
++$ daos fs scan tank mycont --dir-name /projects/a -j
++```
++
++The total is the sum of the logical file sizes (`st_size`). It does not include
++redundancy (replication or erasure coding), metadata, snapshots, or data not yet
++reclaimed by aggregation, and holes in sparse files are counted. The walk takes
++time proportional to the number of entries and is not atomic. Applications can
++get the same statistics from `dfs_scan()`.
++
+ ## Unified NameSpace (UNS)
+ 
+ Many clients support links to other containers as a layer on top of DFS, where a directory in a
+diff --git a/src/client/dfs/cont.c b/src/client/dfs/cont.c
+index 917012c30..709f84ed7 100644
+--- a/src/client/dfs/cont.c
++++ b/src/client/dfs/cont.c
+@@ -1558,40 +1558,67 @@ out_prop:
+ }
+ 
+ struct dfs_scan_args {
+-	time_t   start_time;
+-	time_t   print_time;
+-	uint64_t cur_depth;
+-	uint64_t max_depth;
+-	uint64_t num_files;
+-	uint64_t num_dirs;
+-	uint64_t num_symlinks;
+-	uint64_t total_bytes;
+-	uint64_t largest_file;
+-	uint64_t largest_dir;
+-	uint64_t num_scanned;
++	time_t            start_time;
++	time_t            print_time;
++	uint64_t          flags;
++	uint64_t          cur_depth;
++	dfs_scan_stats_t *stats;
+ };
+ 
++static int
++scan_cb(dfs_t *dfs, dfs_obj_t *parent, const char name[], void *args);
++
++/** iterate over all entries of a directory, descending into sub-directories */
++static int
++scan_dir(dfs_t *dfs, dfs_obj_t *dir, struct dfs_scan_args *scan_args)
++{
++	daos_anchor_t anchor     = {0};
++	uint32_t      nr_entries = DFS_ITER_NR;
++	uint64_t      nr_total   = 0;
++	int           rc;
++
++	while (!daos_anchor_is_eof(&anchor)) {
++		scan_args->cur_depth++;
++		rc = dfs_iterate(dfs, dir, &anchor, &nr_entries, DFS_MAX_NAME * nr_entries, scan_cb,
++				 scan_args);
++		scan_args->cur_depth--;
++		if (rc) {
++			D_ERROR("dfs_iterate() failed: %d\n", rc);
++			return rc;
++		}
++		nr_total += nr_entries;
++		nr_entries = DFS_ITER_NR;
++	}
++
++	if (scan_args->stats->dss_largest_dir < nr_total)
++		scan_args->stats->dss_largest_dir = nr_total;
++	return 0;
++}
++
+ static int
+ scan_cb(dfs_t *dfs, dfs_obj_t *parent, const char name[], void *args)
+ {
+ 	struct dfs_scan_args *scan_args = (struct dfs_scan_args *)args;
++	dfs_scan_stats_t     *stats     = scan_args->stats;
+ 	dfs_obj_t            *obj;
+ 	struct timespec       current_time;
+ 	int                   rc, rc2;
+ 
+-	rc = clock_gettime(CLOCK_REALTIME, &current_time);
+-	if (rc)
+-		return errno;
++	stats->dss_nr_scanned++;
++	if (scan_args->cur_depth > stats->dss_max_depth)
++		stats->dss_max_depth = scan_args->cur_depth;
+ 
+-	scan_args->num_scanned++;
+-	if (scan_args->cur_depth > scan_args->max_depth)
+-		scan_args->max_depth = scan_args->cur_depth;
++	if (scan_args->flags & DFS_SCAN_PRINT_PROGRESS) {
++		rc = clock_gettime(CLOCK_REALTIME, &current_time);
++		if (rc)
++			return errno;
+ 
+-	if (current_time.tv_sec - scan_args->print_time >= DFS_ELAPSED_TIME) {
+-		D_PRINT("DFS scanner: Scanned " DF_U64 " files/directories (runtime: " DF_U64
+-			" sec)\n",
+-			scan_args->num_scanned, current_time.tv_sec - scan_args->start_time);
+-		scan_args->print_time = current_time.tv_sec;
++		if (current_time.tv_sec - scan_args->print_time >= DFS_ELAPSED_TIME) {
++			D_PRINT("DFS scanner: Scanned " DF_U64
++				" files/directories (runtime: " DF_U64 " sec)\n",
++				stats->dss_nr_scanned, current_time.tv_sec - scan_args->start_time);
++			scan_args->print_time = current_time.tv_sec;
++		}
+ 	}
+ 
+ 	/** open the entry name */
+@@ -1603,39 +1630,22 @@ scan_cb(dfs_t *dfs, dfs_obj_t *parent, const char name[], void *args)
+ 
+ 	/** descend into directories */
+ 	if (S_ISDIR(obj->mode)) {
+-		daos_anchor_t anchor     = {0};
+-		uint32_t      nr_entries = DFS_ITER_NR;
+-		uint64_t      nr_total   = 0;
+-
+-		scan_args->num_dirs++;
+-		while (!daos_anchor_is_eof(&anchor)) {
+-			scan_args->cur_depth++;
+-			rc = dfs_iterate(dfs, obj, &anchor, &nr_entries, DFS_MAX_NAME * nr_entries,
+-					 scan_cb, args);
+-			scan_args->cur_depth--;
+-			if (rc) {
+-				D_ERROR("dfs_iterate() failed: %d\n", rc);
+-				D_GOTO(out_obj, rc);
+-			}
+-			nr_total += nr_entries;
+-			nr_entries = DFS_ITER_NR;
+-		}
+-		if (scan_args->largest_dir < nr_total)
+-			scan_args->largest_dir = nr_total;
++		stats->dss_nr_dirs++;
++		rc = scan_dir(dfs, obj, scan_args);
+ 	} else if (S_ISLNK(obj->mode)) {
+-		scan_args->num_symlinks++;
++		stats->dss_nr_symlinks++;
+ 	} else {
+ 		struct stat stbuf;
+ 
+-		scan_args->num_files++;
++		stats->dss_nr_files++;
+ 		rc = dfs_ostat(dfs, obj, &stbuf);
+ 		if (rc) {
+ 			D_ERROR("dfs_ostat() failed: %d\n", rc);
+ 			D_GOTO(out_obj, rc);
+ 		}
+-		scan_args->total_bytes += stbuf.st_size;
+-		if (scan_args->largest_file < stbuf.st_size)
+-			scan_args->largest_file = stbuf.st_size;
++		stats->dss_total_bytes += stbuf.st_size;
++		if (stats->dss_largest_file < stbuf.st_size)
++			stats->dss_largest_file = stbuf.st_size;
+ 	}
+ 
+ out_obj:
+@@ -1645,20 +1655,52 @@ out_obj:
+ 	return rc;
+ }
+ 
++int
++dfs_scan(dfs_t *dfs, dfs_obj_t *dir, uint64_t flags, dfs_scan_stats_t *stats)
++{
++	struct dfs_scan_args scan_args = {0};
++	struct timespec      now;
++	int                  rc;
++
++	if (dfs == NULL || !dfs->mounted)
++		return EINVAL;
++	if (stats == NULL)
++		return EINVAL;
++	if (flags & ~DFS_SCAN_PRINT_PROGRESS)
++		return EINVAL;
++	if (dir == NULL)
++		dir = &dfs->root;
++	if (!S_ISDIR(dir->mode))
++		return ENOTDIR;
++
++	rc = clock_gettime(CLOCK_REALTIME, &now);
++	if (rc)
++		return errno;
++
++	memset(stats, 0, sizeof(*stats));
++	scan_args.start_time = now.tv_sec;
++	scan_args.print_time = now.tv_sec;
++	scan_args.flags      = flags;
++	scan_args.stats      = stats;
++	/** entries of the starting directory are at depth 1 */
++	scan_args.cur_depth = 0;
++
++	return scan_dir(dfs, dir, &scan_args);
++}
++
+ int
+ dfs_cont_scan(daos_handle_t poh, const char *cont, uint64_t flags, const char *subdir)
+ {
+-	dfs_t               *dfs;
+-	daos_handle_t        coh;
+-	struct dfs_scan_args scan_args  = {0};
+-	daos_anchor_t        anchor     = {0};
+-	uint32_t             nr_entries = DFS_ITER_NR;
+-	uint64_t             nr_total   = 0;
+-	struct timespec      now, current_time;
+-	char                 now_name[24];
+-	struct tm           *now_tm;
+-	daos_size_t          len;
+-	int                  rc, rc2;
++	dfs_t           *dfs;
++	dfs_obj_t       *dir = NULL;
++	daos_handle_t    coh;
++	dfs_scan_stats_t stats = {0};
++	char            *path  = NULL;
++	struct timespec  now, current_time;
++	char             now_name[24];
++	struct tm       *now_tm;
++	daos_size_t      len;
++	int              rc, rc2;
+ 
+ 	rc = clock_gettime(CLOCK_REALTIME, &now);
+ 	if (rc)
+@@ -1683,48 +1725,50 @@ dfs_cont_scan(daos_handle_t poh, const char *cont, uint64_t flags, const char *s
+ 		D_GOTO(out_cont, rc);
+ 	}
+ 
+-	scan_args.start_time = now.tv_sec;
+-	scan_args.print_time = now.tv_sec;
+-	scan_args.cur_depth  = 1; /** starting from root at depth 1 */
+-
+-	/** TODO: add support for starting from the subdir args */
+-
+-	/** iterate through the namespace */
+-	while (!daos_anchor_is_eof(&anchor)) {
+-		rc = dfs_iterate(dfs, &dfs->root, &anchor, &nr_entries, DFS_MAX_NAME * nr_entries,
+-				 scan_cb, &scan_args);
++	if (subdir != NULL && subdir[0] != '\0') {
++		/** subdir is relative to the container root, the leading / is optional */
++		D_ASPRINTF(path, "%s%s", subdir[0] == '/' ? "" : "/", subdir);
++		if (path == NULL)
++			D_GOTO(out, rc = ENOMEM);
++		rc = dfs_lookup(dfs, path, O_RDONLY, &dir, NULL, NULL);
+ 		if (rc) {
+-			D_ERROR("dfs_iterate() failed: %d\n", rc);
++			D_ERROR("dfs_lookup() of %s failed: %d\n", path, rc);
+ 			D_GOTO(out, rc);
+ 		}
+-
+-		nr_total += nr_entries;
+-		nr_entries = DFS_ITER_NR;
++		D_PRINT("DFS scanner: Scanning from %s\n", path);
+ 	}
+ 
+-	if (scan_args.largest_dir < nr_total)
+-		scan_args.largest_dir = nr_total;
++	rc = dfs_scan(dfs, dir, DFS_SCAN_PRINT_PROGRESS, &stats);
++	if (rc) {
++		D_ERROR("dfs_scan() failed: %d\n", rc);
++		D_GOTO(out, rc);
++	}
+ 
+ 	rc = clock_gettime(CLOCK_REALTIME, &current_time);
+ 	if (rc)
+ 		D_GOTO(out, rc = errno);
+-	D_PRINT("DFS scanner: Done! (runtime: " DF_U64 " sec)\n",
+-		current_time.tv_sec - scan_args.start_time);
+-
+-	D_PRINT("DFS scanner: " DF_U64 " scanned objects\n", scan_args.num_scanned);
+-	D_PRINT("DFS scanner: " DF_U64 " files\n", scan_args.num_files);
+-	D_PRINT("DFS scanner: " DF_U64 " symlinks\n", scan_args.num_symlinks);
+-	D_PRINT("DFS scanner: " DF_U64 " directories\n", scan_args.num_dirs);
+-	D_PRINT("DFS scanner: " DF_U64 " max tree depth\n", scan_args.max_depth);
+-	D_PRINT("DFS scanner: " DF_U64 " bytes of total data\n", scan_args.total_bytes);
+-	if (scan_args.num_files > 0)
++	D_PRINT("DFS scanner: Done! (runtime: " DF_U64 " sec)\n", current_time.tv_sec - now.tv_sec);
++
++	D_PRINT("DFS scanner: " DF_U64 " scanned objects\n", stats.dss_nr_scanned);
++	D_PRINT("DFS scanner: " DF_U64 " files\n", stats.dss_nr_files);
++	D_PRINT("DFS scanner: " DF_U64 " symlinks\n", stats.dss_nr_symlinks);
++	D_PRINT("DFS scanner: " DF_U64 " directories\n", stats.dss_nr_dirs);
++	D_PRINT("DFS scanner: " DF_U64 " max tree depth\n", stats.dss_max_depth);
++	D_PRINT("DFS scanner: " DF_U64 " bytes of total data\n", stats.dss_total_bytes);
++	if (stats.dss_nr_files > 0)
+ 		D_PRINT("DFS scanner: " DF_U64 " bytes per file on average\n",
+-			scan_args.total_bytes / scan_args.num_files);
+-	D_PRINT("DFS scanner: " DF_U64 " bytes is largest file size\n", scan_args.largest_file);
++			stats.dss_total_bytes / stats.dss_nr_files);
++	D_PRINT("DFS scanner: " DF_U64 " bytes is largest file size\n", stats.dss_largest_file);
+ 	D_PRINT("DFS scanner: " DF_U64 " entries in the largest directory\n",
+-		scan_args.largest_dir);
++		stats.dss_largest_dir);
+ 
+ out:
++	if (dir) {
++		rc2 = dfs_release(dir);
++		if (rc == 0)
++			rc = rc2;
++	}
++	D_FREE(path);
+ 	rc2 = dfs_umount(dfs);
+ 	if (rc == 0)
+ 		rc = rc2;
+diff --git a/src/control/cmd/daos/filesystem.go b/src/control/cmd/daos/filesystem.go
+index 28cc85a21..28db284fd 100644
+--- a/src/control/cmd/daos/filesystem.go
++++ b/src/control/cmd/daos/filesystem.go
+@@ -24,6 +24,7 @@ import "C"
+ import (
+ 	"fmt"
+ 	"strings"
++	"time"
+ 	"unsafe"
+ 
+ 	"github.com/pkg/errors"
+@@ -650,6 +651,18 @@ type fsScanCmd struct {
+ 	DirName string `long:"dir-name" short:"n" description:"subdirectory path to scan. Start from container root if not specified."`
+ }
+ 
++type fsScanStats struct {
++	NumScanned   uint64 `json:"num_scanned"`
++	NumFiles     uint64 `json:"num_files"`
++	NumSymlinks  uint64 `json:"num_symlinks"`
++	NumDirs      uint64 `json:"num_dirs"`
++	MaxDepth     uint64 `json:"max_depth"`
++	TotalBytes   uint64 `json:"total_bytes"`
++	LargestFile  uint64 `json:"largest_file"`
++	LargestDir   uint64 `json:"largest_dir"`
++	RuntimeInSec uint64 `json:"runtime_sec"`
++}
++
+ func (cmd *fsScanCmd) Execute(_ []string) error {
+ 	ap, deallocCmdArgs, err := allocCmdArgs(cmd.Logger)
+ 	if err != nil {
+@@ -657,15 +670,11 @@ func (cmd *fsScanCmd) Execute(_ []string) error {
+ 	}
+ 	defer deallocCmdArgs()
+ 
+-	if err := cmd.resolveContainer(ap); err != nil {
+-		return err
+-	}
+-
+-	cleanupPool, err := cmd.connectPool(C.DAOS_PC_RW, ap)
++	cleanup, err := cmd.resolveAndOpen(daos.ContainerOpenFlagReadOnly, ap)
+ 	if err != nil {
+ 		return err
+ 	}
+-	defer cleanupPool()
++	defer cleanup()
+ 
+ 	var dirName *C.char
+ 	if cmd.DirName != "" {
+@@ -673,10 +682,48 @@ func (cmd *fsScanCmd) Execute(_ []string) error {
+ 		defer freeString(dirName)
+ 	}
+ 
+-	rc := C.dfs_cont_scan(cmd.cPoolHandle, &ap.cont_str[0], 0, dirName)
+-	if err := dfsError(rc); err != nil {
++	// Progress is printed to stdout, so only ask for it when not producing JSON.
++	var flags C.uint64_t
++	if !cmd.JSONOutputEnabled() {
++		flags = C.DFS_SCAN_PRINT_PROGRESS
++		cmd.Infof("DFS scanner: Start (%s)", time.Now().Format("2006-01-02-15:04:05"))
++	}
++
++	start := time.Now()
++	var cStats C.dfs_scan_stats_t
++	if err := dfsError(C.fs_scan_hdlr(ap, dirName, flags, &cStats)); err != nil {
+ 		return errors.Wrapf(err, "failed to scan")
+ 	}
++
++	stats := fsScanStats{
++		NumScanned:   uint64(cStats.dss_nr_scanned),
++		NumFiles:     uint64(cStats.dss_nr_files),
++		NumSymlinks:  uint64(cStats.dss_nr_symlinks),
++		NumDirs:      uint64(cStats.dss_nr_dirs),
++		MaxDepth:     uint64(cStats.dss_max_depth),
++		TotalBytes:   uint64(cStats.dss_total_bytes),
++		LargestFile:  uint64(cStats.dss_largest_file),
++		LargestDir:   uint64(cStats.dss_largest_dir),
++		RuntimeInSec: uint64(time.Since(start).Seconds()),
++	}
++
++	if cmd.JSONOutputEnabled() {
++		return cmd.OutputJSON(stats, nil)
++	}
++
++	cmd.Infof("DFS scanner: Done! (runtime: %d sec)", stats.RuntimeInSec)
++	cmd.Infof("DFS scanner: %d scanned objects", stats.NumScanned)
++	cmd.Infof("DFS scanner: %d files", stats.NumFiles)
++	cmd.Infof("DFS scanner: %d symlinks", stats.NumSymlinks)
++	cmd.Infof("DFS scanner: %d directories", stats.NumDirs)
++	cmd.Infof("DFS scanner: %d max tree depth", stats.MaxDepth)
++	cmd.Infof("DFS scanner: %d bytes of total data", stats.TotalBytes)
++	if stats.NumFiles > 0 {
++		cmd.Infof("DFS scanner: %d bytes per file on average", stats.TotalBytes/stats.NumFiles)
++	}
++	cmd.Infof("DFS scanner: %d bytes is largest file size", stats.LargestFile)
++	cmd.Infof("DFS scanner: %d entries in the largest directory", stats.LargestDir)
++
+ 	return nil
+ }
+ 
+diff --git a/src/include/daos_fs.h b/src/include/daos_fs.h
+index 02c707796..dee734c77 100644
+--- a/src/include/daos_fs.h
++++ b/src/include/daos_fs.h
+@@ -1373,7 +1373,8 @@ dfs_readdir_with_filter(dfs_t *dfs, dfs_obj_t *obj, dfs_pipeline_t *dpipe, daos_
+ 			uint64_t *nr_scanned);
+ 
+ /**
+- * Scan the DFS namespace and report statistics about file/dir size and namespace structure.
++ * Scan the DFS namespace and print statistics about file/dir size and namespace structure to
++ * stdout. Use dfs_scan() to get the statistics back instead.
+  *
+  * \param[in]	poh	Open pool handle.
+  * \param[in]	cont	POSIX container label.
+@@ -1385,6 +1386,47 @@ dfs_readdir_with_filter(dfs_t *dfs, dfs_obj_t *obj, dfs_pipeline_t *dpipe, daos_
+ int
+ dfs_cont_scan(daos_handle_t poh, const char *cont, uint64_t flags, const char *name);
+ 
++enum {
++	/** periodically print the number of entries scanned so far to stdout */
++	DFS_SCAN_PRINT_PROGRESS = (1 << 0),
++};
++
++/** Statistics about a DFS namespace (sub)tree returned by dfs_scan() */
++typedef struct {
++	/** number of entries scanned, the directory the scan starts from is not counted */
++	uint64_t dss_nr_scanned;
++	/** number of regular files */
++	uint64_t dss_nr_files;
++	/** number of directories */
++	uint64_t dss_nr_dirs;
++	/** number of symbolic links */
++	uint64_t dss_nr_symlinks;
++	/** maximum depth of the tree, entries of the starting directory are at depth 1 */
++	uint64_t dss_max_depth;
++	/** sum of the sizes (st_size) of all regular files, in bytes */
++	uint64_t dss_total_bytes;
++	/** size of the largest regular file, in bytes */
++	uint64_t dss_largest_file;
++	/** number of entries in the largest directory */
++	uint64_t dss_largest_dir;
++} dfs_scan_stats_t;
++
++/**
++ * Walk the DFS namespace under a directory and return statistics about file/dir size and
++ * namespace structure. The size reported is the logical size of the files (the sum of st_size), not
++ * the space allocated in the pool. The walk is not atomic: entries changed while it runs may or may
++ * not be counted.
++ *
++ * \param[in]	dfs	Pointer to the mounted file system.
++ * \param[in]	dir	Open directory to scan from. Start from container root if NULL.
++ * \param[in]	flags	Bitmask of DFS_SCAN_* flags, or 0.
++ * \param[out]	stats	Statistics of the scanned tree.
++ *
++ * \return		0 on success, errno code on failure.
++ */
++int
++dfs_scan(dfs_t *dfs, dfs_obj_t *dir, uint64_t flags, dfs_scan_stats_t *stats);
++
+ #if defined(__cplusplus)
+ }
+ #endif /* __cplusplus */
+diff --git a/src/tests/suite/dfs_unit_test.c b/src/tests/suite/dfs_unit_test.c
+index 5d0f91477..285c3ff94 100644
+--- a/src/tests/suite/dfs_unit_test.c
++++ b/src/tests/suite/dfs_unit_test.c
+@@ -3734,6 +3734,140 @@ dfs_test_pipeline_find(void **state)
+ 	test_pipeline_find(state, OC_RP_3GX);
+ }
+ 
++static void
++scan_create_file(dfs_t *dfs, dfs_obj_t *parent, const char *name, daos_off_t off, size_t len)
++{
++	dfs_obj_t  *file;
++	d_sg_list_t sgl;
++	d_iov_t     iov;
++	char       *buf = NULL;
++	int         rc;
++
++	rc = dfs_open(dfs, parent, name, S_IFREG | S_IWUSR | S_IRUSR, O_RDWR | O_CREAT | O_EXCL, 0,
++		      0, NULL, &file);
++	assert_int_equal(rc, 0);
++
++	if (len > 0) {
++		D_ALLOC(buf, len);
++		assert_non_null(buf);
++		d_iov_set(&iov, buf, len);
++		sgl.sg_nr     = 1;
++		sgl.sg_nr_out = 1;
++		sgl.sg_iovs   = &iov;
++		rc            = dfs_write(dfs, file, &sgl, off, NULL);
++		assert_int_equal(rc, 0);
++		D_FREE(buf);
++	}
++
++	rc = dfs_release(file);
++	assert_int_equal(rc, 0);
++}
++
++static void
++dfs_test_scan(void **state)
++{
++	test_arg_t      *arg   = *state;
++	char            *cname = "cont_scan";
++	dfs_t           *dfs;
++	dfs_obj_t       *d1, *d2, *sym, *file;
++	dfs_scan_stats_t stats;
++	char             name[16];
++	int              i;
++	int              rc;
++
++	if (arg->myrank != 0)
++		return;
++
++	rc = dfs_init();
++	assert_int_equal(rc, 0);
++	rc = dfs_connect(arg->pool.pool_str, arg->group, cname, O_CREAT | O_RDWR, NULL, &dfs);
++	assert_int_equal(rc, 0);
++
++	/*
++	 * /f0          4096 bytes
++	 * /f1          sparse, 1024 bytes written at 1 MiB
++	 * /sym -> f0
++	 * /d1/f2       100 bytes
++	 * /d1/d2/f3    10 bytes
++	 * /d1/d2/e0-4  empty files
++	 */
++	scan_create_file(dfs, NULL, "f0", 0, 4096);
++	scan_create_file(dfs, NULL, "f1", 1048576, 1024);
++	rc = dfs_open(dfs, NULL, "sym", S_IFLNK, O_RDWR | O_CREAT | O_EXCL, 0, 0, "f0", &sym);
++	assert_int_equal(rc, 0);
++	rc = dfs_release(sym);
++	assert_int_equal(rc, 0);
++	rc = dfs_open(dfs, NULL, "d1", S_IFDIR | S_IWUSR | S_IRUSR | S_IXUSR, O_RDWR | O_CREAT, 0,
++		      0, NULL, &d1);
++	assert_int_equal(rc, 0);
++	scan_create_file(dfs, d1, "f2", 0, 100);
++	rc = dfs_open(dfs, d1, "d2", S_IFDIR | S_IWUSR | S_IRUSR | S_IXUSR, O_RDWR | O_CREAT, 0, 0,
++		      NULL, &d2);
++	assert_int_equal(rc, 0);
++	scan_create_file(dfs, d2, "f3", 0, 10);
++	for (i = 0; i < 5; i++) {
++		sprintf(name, "e%d", i);
++		scan_create_file(dfs, d2, name, 0, 0);
++	}
++	rc = dfs_release(d2);
++	assert_int_equal(rc, 0);
++
++	/** scan the whole container */
++	rc = dfs_scan(dfs, NULL, 0, &stats);
++	assert_int_equal(rc, 0);
++	assert_int_equal(stats.dss_nr_scanned, 12);
++	assert_int_equal(stats.dss_nr_files, 9);
++	assert_int_equal(stats.dss_nr_dirs, 2);
++	assert_int_equal(stats.dss_nr_symlinks, 1);
++	assert_int_equal(stats.dss_max_depth, 3);
++	assert_int_equal(stats.dss_total_bytes, 4096 + 1048576 + 1024 + 100 + 10);
++	assert_int_equal(stats.dss_largest_file, 1048576 + 1024);
++	assert_int_equal(stats.dss_largest_dir, 6);
++
++	/** scan a subdirectory */
++	rc = dfs_scan(dfs, d1, 0, &stats);
++	assert_int_equal(rc, 0);
++	assert_int_equal(stats.dss_nr_scanned, 8);
++	assert_int_equal(stats.dss_nr_files, 7);
++	assert_int_equal(stats.dss_nr_dirs, 1);
++	assert_int_equal(stats.dss_nr_symlinks, 0);
++	assert_int_equal(stats.dss_max_depth, 2);
++	assert_int_equal(stats.dss_total_bytes, 110);
++	assert_int_equal(stats.dss_largest_file, 100);
++	assert_int_equal(stats.dss_largest_dir, 6);
++	rc = dfs_release(d1);
++	assert_int_equal(rc, 0);
++
++	/** invalid arguments */
++	rc = dfs_scan(dfs, NULL, 0, NULL);
++	assert_int_equal(rc, EINVAL);
++	rc = dfs_scan(dfs, NULL, ~DFS_SCAN_PRINT_PROGRESS, &stats);
++	assert_int_equal(rc, EINVAL);
++	rc = dfs_lookup(dfs, "/f0", O_RDONLY, &file, NULL, NULL);
++	assert_int_equal(rc, 0);
++	rc = dfs_scan(dfs, file, 0, &stats);
++	assert_int_equal(rc, ENOTDIR);
++	rc = dfs_release(file);
++	assert_int_equal(rc, 0);
++
++	/** the container-level scan accepts a subdirectory with or without a leading / */
++	rc = dfs_cont_scan(arg->pool.poh, cname, 0, NULL);
++	assert_int_equal(rc, 0);
++	rc = dfs_cont_scan(arg->pool.poh, cname, 0, "d1/d2");
++	assert_int_equal(rc, 0);
++	rc = dfs_cont_scan(arg->pool.poh, cname, 0, "/d1");
++	assert_int_equal(rc, 0);
++	rc = dfs_cont_scan(arg->pool.poh, cname, 0, "/nonexistent");
++	assert_int_equal(rc, ENOENT);
++
++	rc = dfs_disconnect(dfs);
++	assert_int_equal(rc, 0);
++	rc = dfs_destroy(arg->pool.pool_str, arg->group, cname, 0, NULL);
++	assert_rc_equal(rc, 0);
++	rc = dfs_fini();
++	assert_int_equal(rc, 0);
++}
++
+ static const struct CMUnitTest dfs_unit_tests[] = {
+     {"DFS_UNIT_TEST1: DFS mount / umount", dfs_test_mount, async_disable, test_case_teardown},
+     {"DFS_UNIT_TEST2: DFS container modes", dfs_test_modes, async_disable, test_case_teardown},
+@@ -3776,6 +3910,7 @@ static const struct CMUnitTest dfs_unit_tests[] = {
+     {"DFS_UNIT_TEST28: dfs open/lookup flags", dfs_test_oflags, async_disable, test_case_teardown},
+     {"DFS_UNIT_TEST29: Symlinks with an absolute value", dfs_test_syml_abs, async_disable,
+      test_case_teardown},
++    {"DFS_UNIT_TEST30: dfs scan", dfs_test_scan, async_disable, test_case_teardown},
+ };
+ 
+ static int
+diff --git a/src/utils/daos_dfs_hdlr.c b/src/utils/daos_dfs_hdlr.c
+index 3f608b2fa..72c3569fe 100644
+--- a/src/utils/daos_dfs_hdlr.c
++++ b/src/utils/daos_dfs_hdlr.c
+@@ -206,6 +206,53 @@ out_umount:
+ 	return rc;
+ }
+ 
++int
++fs_scan_hdlr(struct cmd_args_s *ap, const char *dir_name, uint64_t flags, dfs_scan_stats_t *stats)
++{
++	dfs_t     *dfs;
++	dfs_obj_t *dir  = NULL;
++	char      *path = NULL;
++	int        rc, rc2;
++
++	D_ASSERT(ap != NULL);
++	D_ASSERT(stats != NULL);
++
++	rc = dfs_mount(ap->pool, ap->cont, O_RDONLY, &dfs);
++	if (rc) {
++		fprintf(ap->errstream, "failed to mount container %s: %s (%d)\n", ap->cont_str,
++			strerror(rc), rc);
++		return rc;
++	}
++
++	if (dir_name != NULL && dir_name[0] != '\0') {
++		/** dir_name is relative to the container root, the leading / is optional */
++		D_ASPRINTF(path, "%s%s", dir_name[0] == '/' ? "" : "/", dir_name);
++		if (path == NULL)
++			D_GOTO(out_umount, rc = ENOMEM);
++		rc = dfs_lookup(dfs, path, O_RDONLY, &dir, NULL, NULL);
++		if (rc) {
++			fprintf(ap->errstream, "failed to lookup %s (%s)\n", path, strerror(rc));
++			D_GOTO(out_umount, rc);
++		}
++	}
++
++	rc = dfs_scan(dfs, dir, flags, stats);
++	if (rc)
++		fprintf(ap->errstream, "failed to scan %s (%s)\n", path ? path : "/", strerror(rc));
++
++	if (dir) {
++		rc2 = dfs_release(dir);
++		if (rc2 != 0)
++			fprintf(ap->errstream, "failed to release dfs obj\n");
++	}
++out_umount:
++	D_FREE(path);
++	rc2 = dfs_umount(dfs);
++	if (rc2 != 0)
++		fprintf(ap->errstream, "failed to umount DFS container\n");
++	return rc;
++}
++
+ int
+ fs_fix_entry_hdlr(struct cmd_args_s *ap, bool fix_entry)
+ {
+diff --git a/src/utils/daos_hdlr.h b/src/utils/daos_hdlr.h
+index 817ec8b87..412a07c0d 100644
+--- a/src/utils/daos_hdlr.h
++++ b/src/utils/daos_hdlr.h
+@@ -205,6 +205,8 @@ int
+ fs_relink_root_hdlr(struct cmd_args_s *ap);
+ int
+ fs_chmod_hdlr(struct cmd_args_s *ap);
++int
++fs_scan_hdlr(struct cmd_args_s *ap, const char *dir_name, uint64_t flags, dfs_scan_stats_t *stats);
+ 
+ /* Container operations */
+ int
+-- 
+2.43.0
+

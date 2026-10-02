@@ -1,0 +1,22 @@
+# Legacy v1alpha1 machine section: user namespaces, the lab registry, gVisor (siderolabs/gvisor)
+machine:
+  sysctls:
+    user.max_user_namespaces: "11255"
+  registries:
+    mirrors:
+      @REGISTRY@:
+        endpoints: ["http://@REGISTRY@"]
+  files:
+    # let gVisor sandboxes connect to host unix sockets (daos_agent.sock)
+    - path: /var/etc/runsc/runsc.toml
+      op: create
+      permissions: 0o644
+      content: |
+        [runsc_config]
+          host-uds = "open"
+    - path: /etc/cri/conf.d/20-customization.part
+      op: create
+      content: |
+        [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runsc.options]
+          TypeUrl = "io.containerd.runsc.v1.options"
+          ConfigPath = "/var/etc/runsc/runsc.toml"

@@ -1,0 +1,55 @@
+# DAOS built from source on EL9 (scons install + DAOS's own fpm packaging), for the lab.
+# Build context: ./daos, a DAOS source tree with its submodules and the patch set applied
+# (prepared by lib/build.sh). Works for master (utils/build/build_packages.sh) and 2.8
+# (utils/rpms/build_packages.sh). Results in /out:
+#   rpms/             all RPMs (dependencies and DAOS), for "lab deploy <vm> rpms"
+#   opt-daos.tar.gz   the /opt/daos install tree (PREFIX=/opt/daos), for "lab deploy <vm> tree"
+#   daos-src.tar.gz   the source tree (for NLT, which runs from a source tree against /opt/daos)
+FROM docker.io/library/almalinux:9
+
+RUN dnf -y install dnf-plugins-core epel-release && dnf config-manager --set-enabled crb && \
+    dnf clean all
+COPY daos/utils/scripts/install-el9.sh /tmp/install-el9.sh
+RUN INSTALL_BUILD_CI_ONLY=true NO_OPENMPI_DEVEL=1 bash /tmp/install-el9.sh -y && \
+    dnf -y install libipmctl-devel fuse3 && dnf clean all
+
+# master's src/control/go.mod asks for toolchain go1.25; 2.8 is fine with it too
+ARG GO_VERSION=1.25.14
+RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz | tar -C /usr/local -xz && \
+    ln -sf /usr/local/go/bin/go /usr/local/go/bin/gofmt /usr/local/bin/
+# scons only adds the venv (meson, ninja) to the dependency builds' PATH when VIRTUAL_ENV is set
+ENV PATH=/usr/local/go/bin:/opt/venv/bin:$PATH GOTOOLCHAIN=local VIRTUAL_ENV=/opt/venv \
+    LANG=C.UTF-8
+COPY daos/requirements-build.txt /tmp/requirements-build.txt
+RUN python3.11 -m venv /opt/venv && pip install --no-cache-dir -r /tmp/requirements-build.txt
+
+ARG JOBS=10
+WORKDIR /build/daos
+# dependencies first, so that they stay cached while DAOS sources change
+COPY daos/SConstruct daos/VERSION daos/LICENSE ./
+COPY daos/deps deps
+COPY daos/site_scons site_scons
+COPY daos/utils/build.config utils/build.config
+COPY daos/utils/scripts utils/scripts
+RUN scons --build-deps=only --jobs ${JOBS} PREFIX=/opt/daos TARGET_TYPE=release
+
+COPY daos/ ./
+RUN MPI_PKG=any scons --jobs ${JOBS} install PREFIX=/opt/daos BUILD_TYPE=release \
+        TARGET_TYPE=release && go clean -cache
+
+# Built without MPI: the MPI test packages fail to build, everything else is there
+ARG DAOS_RELVAL=.testlab
+RUN mkdir -p /out/rpms && \
+    if [ -x utils/build/build_packages.sh ]; then \
+        DAOS_RELVAL=${DAOS_RELVAL} utils/build/build_packages.sh --build-range=all -Wno-error \
+            /tmp/pkgs || true; \
+        find /tmp/pkgs -name '*.rpm' -exec mv {} /out/rpms/ \; ; \
+    else \
+        export DISTRO=el9 OUTPUT_TYPE=rpm DAOS_RELVAL=${DAOS_RELVAL}; \
+        utils/rpms/build_packages.sh all || true; \
+        mv ./*.rpm /out/rpms/ 2>/dev/null || true; \
+    fi && \
+    ls /out/rpms/daos-client-[0-9]*.rpm && \
+    tar -C / -czf /out/opt-daos.tar.gz opt/daos && \
+    tar -czf /out/daos-src.tar.gz --exclude=./build --exclude=./.git -C /build/daos . && \
+    ls -la /out /out/rpms

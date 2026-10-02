@@ -1,0 +1,4 @@
+# generated per lab by bin/lab: ssh config, known_hosts, lab.env, rendered manifests
+work/
+# local overrides of lab.conf
+lab.conf.local

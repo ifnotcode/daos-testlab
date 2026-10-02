@@ -1,0 +1,253 @@
+# Kubernetes scenarios for dfuse --allow-idmap with csi-daos (mount pods with hostPID): pods with and
+# without user namespaces on a volume whose dfuse runs with --allow-idmap, and the same pods on a
+# control volume whose dfuse runs without it. Applied by tests/k8s-allow-idmap.sh, which replaces
+# the @...@ placeholders (@CLIENT_IMAGE@: an image with the DAOS client of the patched build).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: idmap-test
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: daos-allow-idmap
+provisioner: csi.daos.io
+parameters:
+  pool: @POOL@
+  dfuseArgs: "--allow-idmap"
+  rootUid: "0"
+  rootGid: "0"
+  rootMode: "0777" # DFS has no sticky bit
+  # user-namespaced pods reach DAOS as the agent's default user (@MAPPED_USER@@) for own connections
+  acl: "A::@MAPPED_USER@@:rwta"
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: daos-no-idmap
+provisioner: csi.daos.io
+parameters:
+  pool: @POOL@
+  rootUid: "0"
+  rootGid: "0"
+  rootMode: "0777" # DFS has no sticky bit
+  acl: "A::@MAPPED_USER@@:rwta"
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: idmap
+  namespace: idmap-test
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: daos-allow-idmap
+  resources:
+    requests: {storage: 1Gi}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: plain
+  namespace: idmap-test
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: daos-no-idmap
+  resources:
+    requests: {storage: 1Gi}
+---
+# root of a user namespace: creates a file and a directory it gives to its uid 1000
+apiVersion: v1
+kind: Pod
+metadata:
+  name: userns-root
+  namespace: idmap-test
+spec:
+  hostUsers: false
+  restartPolicy: Never
+  containers:
+  - name: t
+    image: docker.io/library/busybox:1.37
+    command: ["sh", "-c"]
+    args:
+    - |
+      echo "uid_map: $(cat /proc/self/uid_map)"
+      echo hello > /data/by-userns-root && mkdir -p /data/dir-for-1000 &&
+        chown 1000:1000 /data/dir-for-1000 && echo "RESULT create-chown ok"
+      echo "RESULT seen $(stat -c %u:%g /data/by-userns-root) $(stat -c %u:%g /data/dir-for-1000)"
+      sleep 3600
+    volumeMounts: [{name: v, mountPath: /data}]
+  volumes: [{name: v, persistentVolumeClaim: {claimName: idmap}}]
+---
+# uid 1000 of a user namespace
+apiVersion: v1
+kind: Pod
+metadata:
+  name: userns-1000
+  namespace: idmap-test
+spec:
+  hostUsers: false
+  restartPolicy: Never
+  securityContext: {runAsUser: 1000, runAsGroup: 1000}
+  containers:
+  - name: t
+    image: docker.io/library/busybox:1.37
+    command: ["sh", "-c"]
+    args:
+    - |
+      until [ -d /data/dir-for-1000 ]; do sleep 1; done
+      echo x > /data/dir-for-1000/by-userns-1000 && echo "RESULT write-own-dir ok"
+      echo x > /data/by-userns-root 2>/dev/null && echo "RESULT write-root-file ok" ||
+        echo "RESULT write-root-file denied"
+      echo "RESULT seen $(stat -c %u:%g /data/dir-for-1000/by-userns-1000)"
+      sleep 3600
+    volumeMounts: [{name: v, mountPath: /data}]
+  volumes: [{name: v, persistentVolumeClaim: {claimName: idmap}}]
+---
+# no user namespace: sees the owners stored in DAOS
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hostusers-view
+  namespace: idmap-test
+spec:
+  restartPolicy: Never
+  containers:
+  - name: t
+    image: docker.io/library/busybox:1.37
+    command: ["sh", "-c"]
+    args:
+    - |
+      until [ -f /data/dir-for-1000/by-userns-1000 ]; do sleep 1; done
+      echo "RESULT stored $(stat -c %u:%g /data/by-userns-root) $(stat -c %u:%g /data/dir-for-1000) $(stat -c %u:%g /data/dir-for-1000/by-userns-1000)"
+      sleep 3600
+    volumeMounts: [{name: v, mountPath: /data}]
+  volumes: [{name: v, persistentVolumeClaim: {claimName: idmap}}]
+---
+# libpil4dfs as root without a user namespace: gets dfuse's handles (same uid, nested pid namespace)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pil-hostusers
+  namespace: idmap-test
+spec:
+  restartPolicy: Never
+  containers:
+  - name: t
+    image: @CLIENT_IMAGE@
+    imagePullPolicy: IfNotPresent
+    command: ["bash", "-c"]
+    args:
+    - |
+      until [ -s /data/by-userns-root ]; do sleep 1; done
+      data=$(D_LOG_FILE=/tmp/daos.log LD_PRELOAD=libpil4dfs.so D_IL_REPORT=1 D_IL_NO_BYPASS=1 cat /data/by-userns-root 2>/tmp/e)
+      echo "RESULT data $data op_sum $(sed -n 's/^\[op_sum *\] *//p' /tmp/e)"
+      sleep 3600
+    volumeMounts:
+    - {name: v, mountPath: /data}
+    - {name: agent, mountPath: /var/run/daos_agent}
+  volumes:
+  - {name: v, persistentVolumeClaim: {claimName: idmap}}
+  - {name: agent, csi: {driver: csi.daos.io, volumeAttributes: {type: agent-socket}}}
+---
+# libpil4dfs as root of a user namespace: another uid for dfuse, no handles, falls back to dfuse
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pil-userns
+  namespace: idmap-test
+spec:
+  hostUsers: false
+  restartPolicy: Never
+  containers:
+  - name: t
+    image: @CLIENT_IMAGE@
+    imagePullPolicy: IfNotPresent
+    command: ["bash", "-c"]
+    args:
+    - |
+      until [ -s /data/by-userns-root ]; do sleep 1; done
+      data=$(D_LOG_FILE=/tmp/daos.log LD_PRELOAD=libpil4dfs.so D_IL_REPORT=1 D_IL_NO_BYPASS=1 cat /data/by-userns-root 2>/tmp/e)
+      echo "RESULT data $data op_sum $(sed -n 's/^\[op_sum *\] *//p' /tmp/e)"
+      sleep 3600
+    volumeMounts:
+    - {name: v, mountPath: /data}
+    - {name: agent, mountPath: /var/run/daos_agent}
+  volumes:
+  - {name: v, persistentVolumeClaim: {claimName: idmap}}
+  - {name: agent, csi: {driver: csi.daos.io, volumeAttributes: {type: agent-socket}}}
+---
+# libioil as root of a user namespace: refused dfuse's handles, connects with its own credentials
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ioil-userns
+  namespace: idmap-test
+spec:
+  hostUsers: false
+  restartPolicy: Never
+  containers:
+  - name: t
+    image: @CLIENT_IMAGE@
+    imagePullPolicy: IfNotPresent
+    command: ["bash", "-c"]
+    args:
+    - |
+      until [ -s /data/by-userns-root ]; do sleep 1; done
+      LD_PRELOAD=libioil.so D_LOG_FILE=/tmp/il.log D_LOG_MASK=DEBUG DD_MASK=all \
+        dd if=/data/by-userns-root of=/dev/null status=none
+      reads=$(sed -n 's/.*Performed \([0-9]*\) reads.*/\1/p' /tmp/il.log | tail -1)
+      how=dfuse; grep -q "backing off" /tmp/il.log && how=own; [ "${reads:-0}" -gt 0 ] || how=none
+      echo "RESULT handles $how reads $reads"
+      sleep 3600
+    volumeMounts:
+    - {name: v, mountPath: /data}
+    - {name: agent, mountPath: /var/run/daos_agent}
+  volumes:
+  - {name: v, persistentVolumeClaim: {claimName: idmap}}
+  - {name: agent, csi: {driver: csi.daos.io, volumeAttributes: {type: agent-socket}}}
+---
+# control: a user-namespaced pod on a volume whose dfuse does not allow idmapped mounts
+apiVersion: v1
+kind: Pod
+metadata:
+  name: plain-userns
+  namespace: idmap-test
+spec:
+  hostUsers: false
+  restartPolicy: Never
+  containers:
+  - name: t
+    image: docker.io/library/busybox:1.37
+    command: ["sh", "-c", "echo RESULT started; sleep 3600"]
+    volumeMounts: [{name: v, mountPath: /data}]
+  volumes: [{name: v, persistentVolumeClaim: {claimName: plain}}]
+---
+# control: libpil4dfs as root without a user namespace, dfuse without --allow-idmap
+apiVersion: v1
+kind: Pod
+metadata:
+  name: plain-pil-hostusers
+  namespace: idmap-test
+spec:
+  restartPolicy: Never
+  containers:
+  - name: t
+    image: @CLIENT_IMAGE@
+    imagePullPolicy: IfNotPresent
+    command: ["bash", "-c"]
+    args:
+    - |
+      echo hello > /data/f
+      data=$(D_LOG_FILE=/tmp/daos.log LD_PRELOAD=libpil4dfs.so D_IL_REPORT=1 D_IL_NO_BYPASS=1 cat /data/f 2>/tmp/e)
+      echo "RESULT data $data op_sum $(sed -n 's/^\[op_sum *\] *//p' /tmp/e)"
+      sleep 3600
+    volumeMounts:
+    - {name: v, mountPath: /data}
+    - {name: agent, mountPath: /var/run/daos_agent}
+  volumes:
+  - {name: v, persistentVolumeClaim: {claimName: plain}}
+  - {name: agent, csi: {driver: csi.daos.io, volumeAttributes: {type: agent-socket}}}

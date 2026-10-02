@@ -1,0 +1,685 @@
+#!/usr/bin/env bash
+# daos-testlab command line. Run on the workstation; talks to the libvirt host and the VMs over ssh.
+set -euo pipefail
+source "$(dirname "$0")/../lib/common.sh"
+
+usage() {
+	cat <<'EOF'
+usage: lab [-c profile.conf] <command> [args]
+
+Lab (VMs from lab.conf, or from a profile for a second, independent lab):
+  check                         check the libvirt host
+  up [vm...]                    create and set up VMs (default: all; the server first)
+  create <vm...>                create VMs only
+  provision <vm...>             (re)run the role setup on VMs (idempotent)
+  destroy <vm...> --yes         remove VMs with their disks and DHCP leases
+  status                        state and memory of the VMs, kernels, DAOS services, pool
+  ssh <vm|lab> [command]        shell or command on a VM or on the libvirt host
+  kubectl <vm> [args]           kubectl of a k8s or talos VM
+  copy <vm> <path|@build> [dir] copy a local file/directory, or the tarballs of a lab build, to a VM
+                                (default: home directory)
+
+Power (VMs, groups of VM_GROUPS, roles or "all"; default: all. Stopped and suspended VMs free
+their memory on the host):
+  start [vm...]                 boot VMs, or restore suspended ones (alias: resume); the server
+                                first. Waits until each does its job: after a cold boot the server
+                                sets up its pool again, clients reach the pool, nodes are Ready
+  stop [vm...]                  shut VMs down, the server last. The server loses its pool (SCM is
+                                in RAM); start sets it up again
+  suspend [vm...]               save the memory of VMs to the host store and stop them; start
+                                restores them as they were, the server with its pool (Talos: stop)
+  use [group|vm...]             run just these VMs: suspend the others, start these (no argument:
+                                list the groups)
+  kernel <vm> [stock|ml]        boot a VM into its newest stock or ELRepo kernel-ml, until the next
+                                provision (no argument: show the kernels)
+
+DAOS under test:
+  build el9 [--ref R] [--patches DIR]... [--name N]
+                                DAOS from source (branch, tag or full commit SHA; default
+                                master) with a patch set:
+                                RPMs, /opt/daos tarball, source tarball, client image
+  build ubuntu <22.04|24.04> [--ref R] [--patches DIR]... [--name N] [--client]
+                                QSG build (docs.daos.io/latest/QSG/build_from_scratch): /opt/daos tarball;
+                                --client: only the client and its dependencies (scons client install)
+  build csi <base image> <tag>  CSI driver image from $CSI_DIR on top of a client image
+  deploy <vm> rpms <dir|@build> install DAOS RPMs (local dir, or @<name> of a lab build)
+  deploy <vm> tree <tgz|@build> unpack a /opt/daos tree
+  deploy <vm> src <tgz|@build>  unpack a source tree into ~/daos-src (for NLT)
+  deploy <vm> tests [pkg...]    test packages of the deployed build (default daos-client-tests:
+                                dfuse_test, ftest); requirements no repository has are left out
+  deploy <vm> release           back to the DAOS release packages
+  images push <image...>        push images from the host's podman storage to the lab registry
+  csi <vm> <image|@tag>         deploy daos_agent DaemonSet + CSI driver on a k8s/talos VM
+                                (@tag: daos-csi:<tag> in the lab registry)
+
+Tests (tests/<suite>.sh, see tests/README.md):
+  test list
+  test [--keep] [--exclusive] <suite> <vm> [VAR=value...]
+                                starts the VMs the suite needs ("# needs:" line), suspending VMs
+                                it does not need if memory is short (--exclusive: all of them),
+                                and suspends again the VMs it started (--keep: leaves them running)
+EOF
+}
+
+conf=
+if [ "${1:-}" = -c ]; then conf=$2; shift 2; fi
+cmd=${1:-help}
+[ $# -gt 0 ] && shift
+load_config "$conf"
+
+# members of a group of VM_GROUPS (roles or VM names)
+group_members() {
+	local e g rest
+	for e in ${VM_GROUPS[@]+"${VM_GROUPS[@]}"}; do
+		read -r g rest <<<"$e"
+		[ "$g" = "$1" ] && { echo "$rest"; return 0; }
+	done
+	return 1
+}
+
+# VMs named by VM names, groups, roles or "all"; each once, in config order
+resolve_vms() {
+	local t n m list=""
+	for t in "$@"; do
+		if [ "$t" = all ]; then list="$list $(vm_names)"
+		elif is_vm "$t"; then list="$list $t"
+		elif m=$(group_members "$t"); then list="$list $(resolve_vms $m)"
+		elif [ -n "$(vms_with_role "$t")" ]; then list="$list $(vms_with_role "$t")"
+		else die "$t is not a VM, group or role of the config"
+		fi
+	done
+	for n in $(vm_names); do
+		case " $(echo $list) " in *" $n "*) echo "$n" ;; esac
+	done
+}
+
+# VMs from args (see resolve_vms; nothing: all), servers first
+# (bin/lab runs with the workstation's bash, which is 3.2 on macOS: no mapfile, no empty arrays
+# with set -u)
+select_vms() {
+	local list n
+	if [ $# -eq 0 ]; then list=$(vm_names); else list=$(resolve_vms "$@"); fi
+	for n in $list; do [ "$(vm_field "$n" role)" = server ] && echo "$n"; done
+	for n in $list; do [ "$(vm_field "$n" role)" != server ] && echo "$n"; done
+	true
+}
+
+# the same, the server last (stop order)
+select_vms_rev() {
+	local list n
+	list=$(select_vms "$@")
+	for n in $list; do [ "$(vm_field "$n" role)" != server ] && echo "$n"; done
+	for n in $list; do [ "$(vm_field "$n" role)" = server ] && echo "$n"; done
+	true
+}
+
+vm_state() { host_ssh "virsh -c $LIBVIRT_URI domstate $1 2>/dev/null | head -1" || true; }
+# running VMs of this lab (the host may run other labs' VMs too)
+running_vms() {
+	local r n
+	r=$(host_ssh "virsh -c $LIBVIRT_URI list --name --state-running")
+	for n in $(vm_names); do echo "$r" | grep -qx "$n" && echo "$n"; done
+	true
+}
+require_running() {
+	local st
+	st=$(vm_state "$1")
+	[ "$st" = running ] || die "$1 is ${st:-missing}: lab start $1"
+}
+
+# run a node script; exit code 100 means "reboot, then run again"
+step() {
+	local vm=$1 script=$2 rc
+	shift 2
+	log "$vm: $script $*"
+	for _ in 1 2 3; do
+		rc=0
+		vm_run "$vm" "$script" "$@" || rc=$?
+		[ $rc -eq 0 ] && return 0
+		[ $rc -eq 100 ] || die "$vm: $script failed ($rc)"
+		log "$vm: rebooting"
+		vm_reboot "$vm"
+	done
+	die "$vm: $script still wants a reboot"
+}
+
+# a recreated VM has a new host key
+forget_host_key() { ssh-keygen -R "$(vm_field "$1" ip)" -f "$WORK/known_hosts" >/dev/null 2>&1 || true; }
+
+create_vm() {
+	local vm=$1
+	host_ssh "virsh -c $LIBVIRT_URI dominfo $vm" >/dev/null 2>&1 || forget_host_key "$vm"
+	case "$(vm_field "$vm" role)" in
+	talos) host_run host/create-talos.sh "$vm" ;;
+	*)
+		vm_scp "${SSH_KEY}.pub" "lab:/tmp/testlab-key-$LAB_ID.pub" 2>/dev/null ||
+			ssh-keygen -y -f "$SSH_KEY" | host_ssh "cat > /tmp/testlab-key-$LAB_ID.pub"
+		host_run host/create-vm.sh "$vm" "/tmp/testlab-key-$LAB_ID.pub"
+		;;
+	esac
+}
+
+# deploy_rpms <vm> <dir>|@<build>: DAOS RPMs as a local repository that wins over the release
+deploy_rpms() {
+	local vm=$1 from=$2
+	vm_ssh "$vm" 'rm -rf ~/testlab-rpms && mkdir -p ~/testlab-rpms'
+	if [ "${from:0:1}" = @ ]; then
+		host_ssh "test -d $HOST_BUILDS/${from:1}/out/rpms" || die "no RPMs in build ${from:1}"
+		host_ssh "tar cf - -C $HOST_BUILDS/${from:1}/out/rpms --exclude='*debuginfo*' ." |
+			vm_ssh "$vm" 'tar xf - -C ~/testlab-rpms'
+	else
+		vm_scp "$from"/*.rpm "$vm:testlab-rpms/"
+	fi
+	vm_run "$vm" nodes/deploy-rpms.sh
+}
+
+provision_vm() {
+	local vm=$1 role kernel daos=1
+	role=$(vm_field "$vm" role)
+	kernel=$(vm_field "$vm" kernel)
+	# Kubernetes nodes of a lab without a DAOS server (e.g. a course stand) get no DAOS at all
+	case $role in k8s | k8s-worker) [ -n "$(server_vm)" ] || daos=0 ;; esac
+	[ "$(vm_state "$vm")" = running ] || host_run host/vm-power.sh start "$vm"
+	[ "$role" = talos ] && { host_run host/create-talos.sh "$vm"; return; }
+	wait_ssh "$vm"
+	wait_cloud_init "$vm"
+	step "$vm" nodes/base.sh
+	[ "$kernel" = ml ] && step "$vm" nodes/kernel-ml.sh
+	if [ $daos = 1 ]; then
+		step "$vm" nodes/daos-repo.sh
+		# a verbs provider: software RDMA on eth0 first (the lab has no RDMA hardware)
+		case $DAOS_PROVIDER in *verbs*) [ "$role" = ftest ] || step "$vm" nodes/rdma.sh ;; esac
+		# DAOS under test from the start (e.g. a build that the release agent cannot work with)
+		if [ -n "${DAOS_BUILD:-}" ] && [ "$role" != ftest ]; then
+			log "$vm: DAOS $DAOS_BUILD"
+			deploy_rpms "$vm" "$DAOS_BUILD"
+		fi
+	fi
+	case $role in
+	server) step "$vm" nodes/daos-server.sh; step "$vm" nodes/registry.sh ;;
+	client) step "$vm" nodes/daos-client.sh ;;
+	k8s)
+		[ $daos = 1 ] && step "$vm" nodes/daos-client.sh
+		step "$vm" nodes/k8s.sh
+		;;
+	k8s-worker)
+		[ $daos = 1 ] && step "$vm" nodes/daos-client.sh
+		join_worker "$vm"
+		;;
+	ftest) step "$vm" nodes/ftest-node.sh; ftest_ssh "$vm" ;;
+	*) die "unknown role $role" ;;
+	esac
+	# give freed blocks (package caches, downloads) back to the thin disk in the host pool
+	vm_ssh "$vm" 'sudo dnf clean all -q; sudo fstrim -a' >/dev/null 2>&1 || true
+	log "$vm ($role) ready"
+}
+
+# ftest nodes: one ssh key of VM_USER for all of them, as launch.py runs clush from one node to all
+ftest_ssh() {
+	local vm=$1 key=$WORK/ftest_id
+	[ -f "$key" ] || ssh-keygen -q -t ed25519 -N '' -C "ftest@$LAB_ID" -f "$key"
+	vm_scp "$key" "$vm:.ssh/id_ed25519"
+	vm_scp "$key.pub" "$vm:.ssh/id_ed25519.pub"
+	vm_ssh "$vm" 'bash -s' <<'EOF'
+chmod 600 ~/.ssh/id_ed25519
+grep -qF "$(cat ~/.ssh/id_ed25519.pub)" ~/.ssh/authorized_keys ||
+	cat ~/.ssh/id_ed25519.pub >>~/.ssh/authorized_keys
+printf 'Host *\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null\n    LogLevel ERROR\n' \
+	>~/.ssh/config
+chmod 600 ~/.ssh/config
+EOF
+}
+
+# the control plane of the lab's kubeadm cluster: workers join it, kubectl of a worker runs there
+control_plane() {
+	local cp
+	cp=$(vms_with_role k8s | head -1)
+	[ -n "$cp" ] || die "the config has no VM of role k8s (the control plane)"
+	echo "$cp"
+}
+
+# kubeadm join with a fresh token from the control plane (it must be up and provisioned)
+join_worker() {
+	local vm=$1 cp join
+	cp=$(control_plane)
+	require_running "$cp"
+	# "kubeadm join <endpoint> --token <token> --discovery-token-ca-cert-hash <hash>"
+	join=$(vm_ssh "$cp" sudo kubeadm token create --ttl 1h --print-join-command) ||
+		die "$vm: no join token from $cp (lab provision $cp first)"
+	# shellcheck disable=SC2086
+	set -- $join
+	[ "$1 $2" = "kubeadm join" ] && [ "$4" = --token ] || die "$vm: unexpected join command from $cp"
+	step "$vm" nodes/k8s.sh join "$3" "$5" "$7"
+}
+
+kubectl_for() {
+	local vm=$1
+	shift
+	case "$(vm_field "$vm" role)" in
+	k8s) vm_ssh "$vm" kubectl "$@" ;;
+	k8s-worker) vm_ssh "$(control_plane)" kubectl "$@" ;;
+	talos) host_ssh "KUBECONFIG=$HOST_WORK/talos/$vm/kubeconfig $HOST_WORK/bin/kubectl $*" ;;
+	*) die "$vm is not a Kubernetes node" ;;
+	esac
+}
+
+# DAOS on the server: pool and container exist. After a cold boot they do not: SCM is in RAM.
+server_has_pool() {
+	vm_ssh "$1" "sudo dmg -o /etc/daos/daos_control.yml pool list 2>/dev/null | grep -q '^$POOL ' &&
+		sudo -u $CONT_OWNER daos cont query $POOL $CONT >/dev/null 2>&1"
+}
+
+# daos_agent of a client: the host service, or the DaemonSet after "lab csi"
+restart_agent() {
+	case "$(vm_field "$1" role)" in
+	talos)
+		kubectl_for "$1" -n daos-csi rollout restart ds/daos-agent >/dev/null 2>&1 &&
+			kubectl_for "$1" -n daos-csi rollout status ds/daos-agent --timeout=180s >/dev/null
+		;;
+	*)
+		vm_ssh "$1" 'if [ -f /etc/daos/testlab-agent-daemonset ]; then
+				kubectl -n daos-csi rollout restart ds/daos-agent &&
+					kubectl -n daos-csi rollout status ds/daos-agent --timeout=180s
+			else sudo systemctl restart daos_agent; fi' >/dev/null
+		;;
+	esac
+}
+
+# wait until a client VM reaches the pool, restarting its agent once
+client_ready() {
+	local vm=$1 i
+	pool_q() { vm_ssh "$vm" "sudo -u $CONT_OWNER daos pool query $POOL >/dev/null 2>&1"; }
+	for i in $(seq 1 12); do pool_q && return 0; sleep 5; done
+	log "$vm: pool $POOL not reachable, restarting daos_agent"
+	restart_agent "$vm" || true
+	for i in $(seq 1 12); do pool_q && return 0; sleep 5; done
+	warn "$vm: pool $POOL is not reachable"
+}
+
+# system pods of a cluster Ready: kube-system, and daos-csi once "lab csi" has deployed it
+system_pods_ready() {
+	local ns
+	for ns in kube-system daos-csi; do
+		[ $ns = daos-csi ] && ! kubectl_for "$1" get ns daos-csi >/dev/null 2>&1 && continue
+		kubectl_for "$1" -n $ns wait --for=condition=Ready pods --all --timeout=10s >/dev/null 2>&1 ||
+			return 1
+	done
+}
+
+# Kubernetes cluster of a k8s or talos VM usable after a boot: the node is Ready, and so are the
+# system pods. The control plane restarts its pods a minute or two after the node is Ready, and
+# requests in between fail, so the pods have to stay Ready for a while.
+node_ready() {
+	local i nodes=nodes
+	# a worker: its own Node object (the control plane's cluster has several nodes)
+	[ "$(vm_field "$1" role)" = k8s-worker ] && nodes="node $1"
+	for i in $(seq 1 60); do
+		# shellcheck disable=SC2086
+		kubectl_for "$1" get $nodes --no-headers 2>/dev/null | grep -q ' Ready ' && break
+		[ "$i" = 60 ] && { warn "$1: node not Ready after 5 minutes"; return 0; }
+		sleep 5
+	done
+	# pods that the node shutdown terminated stay behind as Failed, and would never be Ready
+	kubectl_for "$1" delete pods -A --field-selector=status.phase=Failed >/dev/null 2>&1 || true
+	for i in $(seq 1 30); do
+		if system_pods_ready "$1" && sleep 20 && system_pods_ready "$1"; then
+			log "$1: node and system pods Ready"
+			return 0
+		fi
+		sleep 5
+	done
+	warn "$1: system pods not Ready after 15 minutes"
+}
+
+# after "lab start": wait until the VM does its job. Sets POOL_RECREATED when the server had to
+# set up its pool again.
+wait_ready() {
+	local vm=$1 role
+	role=$(vm_field "$vm" role)
+	[ "$role" = talos ] && { node_ready "$vm"; return 0; }
+	wait_ssh "$vm"
+	case $role in
+	server)
+		if server_has_pool "$vm"; then
+			log "$vm: DAOS ready with pool $POOL"
+		else
+			log "$vm: no pool $POOL (the SCM in RAM is empty after a cold boot), setting it up again"
+			step "$vm" nodes/daos-server.sh
+			POOL_RECREATED=1
+		fi
+		;;
+	k8s | k8s-worker) node_ready "$vm" ;;
+	esac
+	# DAOS clients: the pool, if the lab has a server
+	case $role in client | k8s | k8s-worker) ;; *) return 0 ;; esac
+	[ -n "$(server_vm)" ] || return 0
+	if [ "$(vm_state "$(server_vm)")" = running ]; then
+		client_ready "$vm" && log "$vm: reaches pool $POOL"
+	else
+		log "$vm: the server $(server_vm) is not running, pool not checked"
+	fi
+	return 0
+}
+
+# start VMs (the server first) and wait until each does its job
+start_vms() {
+	local vms vm running
+	[ $# -gt 0 ] || return 0
+	vms=$(select_vms "$@")
+	# no autostart, free page reporting: once per VM, effective from its next cold start
+	host_run host/vm-power.sh config $vms
+	for vm in $vms; do
+		host_run host/vm-power.sh start "$vm"
+		wait_ready "$vm"
+	done
+	# shellcheck disable=SC2086
+	after_new_pool $vms
+}
+
+# after the server set up its pool again (POOL_RECREATED): restart the agents of running clients
+# other than the given VMs, which wait_ready has checked already
+after_new_pool() {
+	local running vm checked=" $* "
+	[ "$POOL_RECREATED" = 1 ] || return 0
+	running=$(running_vms)
+	for vm in $running; do
+		[ "$(vm_field "$vm" role)" = server ] && continue
+		case $checked in *" $vm "*) continue ;; esac
+		log "$vm: restarting daos_agent for the new pool"
+		restart_agent "$vm" || warn "$vm: could not restart daos_agent"
+	done
+	log "pool $POOL was set up again: dfuse mounts made before are stale, mount them again"
+	POOL_RECREATED=0
+}
+
+# power_down <stop|suspend> <vm...>: the server last; warns about clients left without it
+power_down() {
+	local what=$1 vms srv running vm
+	shift
+	[ $# -gt 0 ] || return 0
+	vms=$(select_vms_rev "$@")
+	srv=$(server_vm)
+	if [ -n "$srv" ] && echo "$vms" | grep -qx "$srv"; then
+		running=$(running_vms)
+		for vm in $(vm_names); do
+			[ "$vm" = "$srv" ] && continue
+			if echo "$running" | grep -qx "$vm" && ! echo "$vms" | grep -qx "$vm"; then
+				warn "$vm keeps running without the server: its dfuse mounts and pool connections fail"
+			fi
+		done
+		if [ "$what" = stop ]; then
+			log "$srv: its pool goes with it (SCM is in RAM); start sets it up again, suspend would keep it"
+		fi
+	fi
+	for vm in $vms; do host_run host/vm-power.sh "$what" "$vm"; done
+}
+
+gb() { awk -v m="$1" 'BEGIN {printf "%.1f GB", m / 1024}'; }
+
+# mem_info: "host <available MB>" and "<vm> <state> <RAM> <saved image> <in use>" lines (MB)
+mem_info() { host_run host/vm-power.sh mem; }
+
+# memory the given VMs need to start (MB): a suspended VM its saved RAM, a stopped one its RAM
+mem_needed() {
+	local info=$1 vm need=0 st ram img
+	shift
+	for vm in "$@"; do
+		read -r st ram img <<<"$(echo "$info" | awk -v v="$vm" '$1 == v {print $2, $3, $4}')"
+		case $st in
+		saved) need=$((need + img)) ;;
+		stopped) need=$((need + ram)) ;;
+		esac
+	done
+	echo $need
+}
+
+# make_room "<needed VMs>" "<VMs to start>": suspend running VMs that are not needed, biggest
+# first and the server last, until the VMs to start fit into the host's available memory
+make_room() {
+	local needed=$1 info need avail vm use cands
+	[ -n "$2" ] || return 0
+	info=$(mem_info)
+	# shellcheck disable=SC2086
+	need=$(mem_needed "$info" $2)
+	avail=$(($(echo "$info" | awk '$1 == "host" {print $2}') - HOST_MEM_RESERVE_GB * 1024))
+	[ "$need" -le "$avail" ] && return 0
+	cands=$(echo "$info" | awk '$2 == "running" {print $5, $1}' | sort -rn | awk '{print $2}')
+	for vm in $(echo "$cands" | grep -vx "$(server_vm)"; echo "$cands" | grep -x "$(server_vm)"); do
+		[ "$need" -le "$avail" ] && break
+		echo "$needed" | grep -qx "$vm" && continue
+		use=$(echo "$info" | awk -v v="$vm" '$1 == v {print $5}')
+		log "making room ($(gb $need) needed, $(gb $avail) available): suspending $vm"
+		power_down suspend "$vm"
+		avail=$((avail + use))
+	done
+	[ "$need" -le "$avail" ] ||
+		warn "starting VMs that may need $(gb $need), $(gb $avail) is available: the host may swap"
+}
+
+# warn when the VMs to start may not fit (lab start does not suspend anything by itself)
+check_budget() {
+	local info need avail
+	[ $# -gt 0 ] || return 0
+	info=$(mem_info)
+	need=$(mem_needed "$info" "$@")
+	avail=$(($(echo "$info" | awk '$1 == "host" {print $2}') - HOST_MEM_RESERVE_GB * 1024))
+	[ "$need" -le "$avail" ] ||
+		warn "these VMs may need $(gb $need), $(gb $avail) is available: the host may swap (lab use or lab suspend frees memory)"
+}
+
+# VMs of a list that are not running
+not_running() {
+	local running vm
+	running=$(running_vms)
+	for vm in "$@"; do echo "$running" | grep -qx "$vm" || echo "$vm"; done
+	true
+}
+
+# the whole command runs from a function: bash has read the complete file before it starts, so
+# editing bin/lab while a long command (build, up) runs does not break that command
+main() {
+POOL_RECREATED=0
+case $cmd in
+help | -h | --help) usage ;;
+check) host_run host/check.sh ;;
+create) for vm in $(select_vms "$@"); do create_vm "$vm"; done ;;
+provision) for vm in $(select_vms "$@"); do provision_vm "$vm"; done ;;
+up)
+	vms=$(select_vms "$@")
+	for vm in $vms; do create_vm "$vm"; done
+	for vm in $vms; do provision_vm "$vm"; done
+	log "lab $LAB_ID is up: $(echo $vms)"
+	;;
+destroy)
+	[ "${*: -1}" = --yes ] || die "destroy removes VMs and their disks; add --yes"
+	set -- "${@:1:$(($# - 1))}"
+	[ $# -gt 0 ] || die "name the VMs to destroy"
+	for vm in "$@"; do
+		is_vm "$vm" || die "$vm is not in the config"
+		host_run host/destroy-vm.sh "$vm"
+		forget_host_key "$vm"
+	done
+	;;
+start | resume)
+	vms=$(select_vms "$@")
+	# shellcheck disable=SC2086
+	check_budget $(not_running $vms)
+	# shellcheck disable=SC2086
+	start_vms $vms
+	;;
+stop | suspend)
+	# shellcheck disable=SC2046
+	power_down "$cmd" $(select_vms "$@")
+	;;
+use)
+	if [ $# -eq 0 ]; then
+		for e in ${VM_GROUPS[@]+"${VM_GROUPS[@]}"}; do
+			read -r g rest <<<"$e"
+			printf '  %-14s %s\n' "$g" "$(echo $(resolve_vms $rest))"
+		done
+		exit 0
+	fi
+	vms=$(select_vms "$@")
+	others=""
+	for vm in $(running_vms); do echo "$vms" | grep -qx "$vm" || others="$others $vm"; done
+	# shellcheck disable=SC2086
+	power_down suspend $others
+	# shellcheck disable=SC2086
+	start_vms $vms
+	log "running: $(echo $(running_vms))"
+	;;
+kernel)
+	vm=${1:?vm} k=${2:-}
+	require_running "$vm"
+	[ "$(vm_field "$vm" role)" = talos ] && die "$vm: Talos brings its own kernel"
+	if [ -z "$k" ]; then
+		vm_ssh "$vm" 'echo "running $(uname -r), default $(sudo grubby --default-kernel)";
+			ls -1 /boot/vmlinuz-* | grep -v rescue'
+		exit 0
+	fi
+	step "$vm" nodes/kernel.sh "$k"
+	wait_ready "$vm"
+	after_new_pool "$vm"
+	log "$vm runs $(vm_ssh "$vm" uname -r)"
+	;;
+status)
+	host_run host/vm-power.sh status
+	running=$(running_vms)
+	for vm in $(vm_names); do
+		echo "$running" | grep -qx "$vm" || continue
+		role=$(vm_field "$vm" role)
+		if [ "$role" = talos ]; then
+			echo "$vm (talos): $(kubectl_for "$vm" get nodes --no-headers 2>/dev/null | awk '{print $2, $5}' || echo unreachable)"
+			continue
+		fi
+		echo "$vm ($role): $(vm_ssh "$vm" -o ConnectTimeout=5 'echo "$(uname -r), agent $(systemctl is-active daos_agent), server $(systemctl is-active daos_server 2>/dev/null)"' 2>/dev/null || echo unreachable)"
+	done
+	srv=$(server_vm)
+	[ -n "$srv" ] && echo "$running" | grep -qx "$srv" &&
+		vm_ssh "$srv" "sudo dmg -o /etc/daos/daos_control.yml pool list" 2>/dev/null | sed 's/^/  /' || true
+	;;
+ssh)
+	t=${1:?vm or lab}
+	shift
+	if [ "$t" = lab ]; then host_ssh "$@"; else require_running "$t"; vm_ssh "$t" "$@"; fi
+	;;
+kubectl) vm=${1:?vm}; shift; require_running "$vm"; kubectl_for "$vm" "$@" ;;
+copy)
+	vm=${1:?vm} src=${2:?local path or @build} dst=${3:-.}
+	require_running "$vm"
+	if [ "${src:0:1}" = @ ]; then
+		# files of a lab build (tarballs), without the RPMs
+		host_ssh "tar cf - -C $HOST_BUILDS/${src:1}/out --exclude=./rpms ." |
+			vm_ssh "$vm" "mkdir -p $dst && tar xvf - -C $dst"
+	else
+		vm_scp -r "$src" "$vm:$dst"
+	fi
+	;;
+deploy)
+	vm=${1:?vm} what=${2:?rpms, tree, src, tests or release} from=${3:-}
+	require_running "$vm"
+	# "@<build>" takes the result of "lab build" from the host, streamed to the VM
+	build_out=""
+	[ "${from:0:1}" = @ ] && build_out=$HOST_BUILDS/${from:1}/out
+	case $what in
+	rpms)
+		[ -n "$from" ] || die "usage: lab deploy <vm> rpms <dir>|@<build>"
+		deploy_rpms "$vm" "$from"
+		;;
+	tree | src)
+		[ -n "$from" ] || die "usage: lab deploy <vm> $what <tar.gz>|@<build>"
+		if [ -n "$build_out" ]; then
+			f=opt-daos.tar.gz
+			[ "$what" = src ] && f=daos-src.tar.gz
+			host_ssh "cat $build_out/$f" | vm_ssh "$vm" 'cat > ~/testlab.tar.gz'
+		else
+			vm_scp "$from" "$vm:testlab.tar.gz"
+		fi
+		if [ "$what" = tree ]; then
+			vm_run "$vm" nodes/deploy-tree.sh
+		else
+			vm_ssh "$vm" 'rm -rf ~/daos-src && mkdir ~/daos-src && tar -xzf ~/testlab.tar.gz -C ~/daos-src && rm ~/testlab.tar.gz && echo "source tree in ~/daos-src"'
+		fi
+		;;
+	release) vm_run "$vm" nodes/deploy-rpms.sh --release ;;
+	tests)
+		# test packages of the build deployed with "rpms"
+		shift 2
+		vm_run "$vm" nodes/deploy-tests.sh "$@"
+		;;
+	*) die "deploy what: rpms, tree, src, tests or release" ;;
+	esac
+	;;
+images)
+	[ "${1:-}" = push ] || die "usage: lab images push <image...>"
+	shift
+	reg=$(grep '^REGISTRY=' "$WORK/lab.env" | cut -d= -f2)
+	for img in "$@"; do
+		dest="$reg/${img##*/}"
+		host_podman "podman tag $img $dest && podman push -q --tls-verify=false $dest" && log "pushed $dest"
+	done
+	;;
+csi) require_running "${1:?vm}"; source "$LAB_ROOT/lib/csi.sh"; deploy_csi "$1" "${2:?image}" ;;
+build) source "$LAB_ROOT/lib/build.sh"; build "$@" ;;
+test)
+	keep=0 exclusive=0
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--keep) keep=1; shift ;;
+		--exclusive) exclusive=1; shift ;;
+		*) break ;;
+		esac
+	done
+	suite=${1:?suite or list}
+	if [ "$suite" = list ]; then
+		for f in "$LAB_ROOT"/tests/*.sh; do printf '  %-18s %s\n' "$(basename "$f" .sh)" "$(sed -n 2p "$f" | sed 's/^# //')"; done
+		exit 0
+	fi
+	vm=${2:?vm}
+	shift 2
+	[ -f "$LAB_ROOT/tests/$suite.sh" ] || die "no test suite $suite"
+	is_vm "$vm" || die "$vm is not in the config"
+	# what the suite needs besides the VM it runs on: "# needs: <roles, groups or VMs | none>"
+	needs=$(sed -n 's/^# needs: *//p' "$LAB_ROOT/tests/$suite.sh" | head -1)
+	[ "$needs" = none ] && needs=""
+	# shellcheck disable=SC2086
+	needed=$(select_vms "$vm" $needs)
+	# shellcheck disable=SC2086
+	started=$(not_running $needed)
+	if [ "$exclusive" = 1 ]; then
+		others=""
+		for n in $(running_vms); do echo "$needed" | grep -qx "$n" || others="$others $n"; done
+		# shellcheck disable=SC2086
+		power_down suspend $others
+	else
+		make_room "$needed" "$(echo $started)"
+	fi
+	# shellcheck disable=SC2086
+	start_vms $started
+	vars="" # VAR=value arguments, quoted for the remote shell
+	[ $# -eq 0 ] || vars=$(printf '%q ' "$@")
+	rc=0
+	case "$(vm_field "$vm" role)" in
+	talos)
+		# Talos has no shell: Kubernetes suites run on the host with the cluster's kubeconfig
+		push_files lab "$HOST_WORK/tests" tests
+		host_ssh "env KUBECONFIG=$HOST_WORK/talos/$vm/kubeconfig PATH=$HOST_WORK/bin:\$PATH LAB_ENV=$HOST_WORK/tests/lab.env $vars bash $HOST_WORK/tests/tests/$suite.sh" || rc=$?
+		;;
+	*)
+		push_files "$vm" /tmp/testlab tests
+		vm_ssh "$vm" "sudo env KUBECONFIG=/etc/kubernetes/admin.conf LAB_ENV=/tmp/testlab/lab.env $vars bash /tmp/testlab/tests/$suite.sh" || rc=$?
+		;;
+	esac
+	if [ "$keep" = 0 ] && [ -n "$started" ]; then
+		log "suspending again what the test started: $(echo $started)"
+		# shellcheck disable=SC2086
+		power_down suspend $started
+	fi
+	exit $rc
+	;;
+*) usage; die "unknown command $cmd" ;;
+esac
+}
+
+# one line: bash has read it before main runs, so no later edit of this file is read afterwards
+main "$@"; exit $?

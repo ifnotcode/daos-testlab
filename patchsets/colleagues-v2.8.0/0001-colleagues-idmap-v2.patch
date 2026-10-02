@@ -1,0 +1,107 @@
+diff --git a/deps/patches/fused/0001_idmap_support.patch b/deps/patches/fused/0001_idmap_support.patch
+new file mode 100644
+index 000000000..766efc78b
+--- /dev/null
++++ b/deps/patches/fused/0001_idmap_support.patch
+@@ -0,0 +1,64 @@
++diff --git a/include/fuse_common.h b/include/fuse_common.h
++index e6c3b5d..8565bc2 100644
++--- a/include/fuse_common.h
+++++ b/include/fuse_common.h
++@@ -502,6 +502,17 @@ struct fuse_loop_config_v1 {
++  */
++ #define FUSE_CAP_NO_EXPORT_SUPPORT  (1 << 30)
++ 
+++/**
+++ * Indicates support for idmapped mounts.
+++ *
+++ * If this flag is set in the `capable` field of the `fuse_conn_info`
+++ * structure, then the FUSE kernel module supports idmapped mounts of
+++ * this filesystem.
+++ *
+++ * This feature is disabled by default.
+++ */
+++#define FUSE_CAP_ALLOW_IDMAP      (1u << 31)
+++
++ /**
++  * Ioctl flags
++  *
++diff --git a/include/fuse_kernel.h b/include/fuse_kernel.h
++index d08b99d..57823ff 100644
++--- a/include/fuse_kernel.h
+++++ b/include/fuse_kernel.h
++@@ -421,6 +421,7 @@ struct fuse_file_lock {
++  * FUSE_NO_EXPORT_SUPPORT: explicitly disable export support
++  * FUSE_HAS_RESEND: kernel supports resending pending requests, and the high bit
++  *		    of the request ID indicates resend requests
+++ * FUSE_ALLOW_IDMAP: allow idmapped mounts
++  */
++ #define FUSE_ASYNC_READ		(1 << 0)
++ #define FUSE_POSIX_LOCKS	(1 << 1)
++@@ -463,6 +464,7 @@ struct fuse_file_lock {
++ #define FUSE_PASSTHROUGH	(1ULL << 37)
++ #define FUSE_NO_EXPORT_SUPPORT	(1ULL << 38)
++ #define FUSE_HAS_RESEND		(1ULL << 39)
+++#define FUSE_ALLOW_IDMAP	(1ULL << 40)
++ 
++ /* Obsolete alias for FUSE_DIRECT_IO_ALLOW_MMAP */
++ #define FUSE_DIRECT_IO_RELAX	FUSE_DIRECT_IO_ALLOW_MMAP
++diff --git a/lib/fuse_lowlevel.c b/lib/fuse_lowlevel.c
++index 1848f1d..33a89c3 100644
++--- a/lib/fuse_lowlevel.c
+++++ b/lib/fuse_lowlevel.c
++@@ -2104,6 +2104,8 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
++ 			se->conn.capable |= FUSE_CAP_PASSTHROUGH;
++ 		if (inargflags & FUSE_NO_EXPORT_SUPPORT)
++ 			se->conn.capable |= FUSE_CAP_NO_EXPORT_SUPPORT;
+++		if (inargflags & FUSE_ALLOW_IDMAP)
+++			se->conn.capable |= FUSE_CAP_ALLOW_IDMAP;
++ 	} else {
++ 		se->conn.max_readahead = 0;
++ 	}
++@@ -2244,6 +2246,8 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
++ 	}
++ 	if (se->conn.want & FUSE_CAP_NO_EXPORT_SUPPORT)
++ 		outargflags |= FUSE_NO_EXPORT_SUPPORT;
+++	if (se->conn.want & FUSE_CAP_ALLOW_IDMAP)
+++		outargflags |= FUSE_ALLOW_IDMAP;
++ 
++ 	if (inargflags & FUSE_INIT_EXT) {
++ 		outargflags |= FUSE_INIT_EXT;
+diff --git a/src/client/dfuse/dfuse_fuseops.c b/src/client/dfuse/dfuse_fuseops.c
+index d3183f480..590a564c4 100644
+--- a/src/client/dfuse/dfuse_fuseops.c
++++ b/src/client/dfuse/dfuse_fuseops.c
+@@ -54,6 +54,7 @@ dfuse_show_flags(void *handle, unsigned int cap, unsigned int want)
+ 	SHOW_FLAG(handle, cap, want, FUSE_CAP_DIRECT_IO_ALLOW_MMAP);
+ 	SHOW_FLAG(handle, cap, want, FUSE_CAP_PASSTHROUGH);
+ 	SHOW_FLAG(handle, cap, want, FUSE_CAP_NO_EXPORT_SUPPORT);
++	SHOW_FLAG(handle, cap, want, FUSE_CAP_ALLOW_IDMAP);
+ 
+ 	if (cap)
+ 		DFUSE_TRA_WARNING(handle, "Unknown capability flags %#x", cap);
+@@ -93,6 +94,15 @@ dfuse_fuse_init(void *arg, struct fuse_conn_info *conn)
+ #ifdef FUSE_CAP_CACHE_SYMLINKS
+ 	conn->want |= FUSE_CAP_CACHE_SYMLINKS;
+ #endif
++
++	/* Включаем ALLOW_IDMAP, если ядро его поддерживает */
++	if (conn->capable & FUSE_CAP_ALLOW_IDMAP) {
++		conn->want |= FUSE_CAP_ALLOW_IDMAP;
++		DFUSE_TRA_INFO(dfuse_info, "Enabling FUSE_CAP_ALLOW_IDMAP for unprivileged pods");
++	} else {
++		DFUSE_TRA_WARNING(dfuse_info, "Kernel does not report FUSE_CAP_ALLOW_IDMAP capability!");
++	}
++
+ 	dfuse_show_flags(dfuse_info, conn->capable, conn->want);
+ 
+ 	conn->time_gran            = 1;
+diff --git a/utils/build.config b/utils/build.config
+index 4de73193b..a33f98ed7 100644
+--- a/utils/build.config
++++ b/utils/build.config
+@@ -30,3 +30,4 @@ spdk=0001_external_isal_v26.01.patch
+ mercury=0001_dep_versions.patch,0002_ofi_counters.patch,0003_ofi_auth_key.patch,0004_ucx_connection_reset.patch,0005_ucx_put_flush.patch
+ pmdk=https://github.com/daos-stack/pmdk/commit/bb048d67ccd07609f86a5e8b3c6ad54414d593ee.diff,https://github.com/daos-stack/pmdk/commit/69925cf455ef672c4cbdbdb13bef7ae581e67045.diff,https://github.com/daos-stack/pmdk/commit/6805ed4f8d1a4e4c6070bf8b68f0dffef08b9c99.diff
+ argobots=0001_411e5b344642ebc82190fd8b125db512e5b449d1.diff,0002_bb0c908abfac4bfe37852eee621930634183c6aa.diff
++fused=0001_idmap_support.patch

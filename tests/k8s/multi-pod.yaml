@@ -1,0 +1,147 @@
+# Many pods on one csi-daos volume of dfuse --allow-idmap (one dfuse, one idmapped bind mount per
+# user-namespaced pod). The pods only sleep; tests/k8s-multi-pod.sh does the steps with kubectl exec.
+# Placeholders: @CLIENT_IMAGE@ (DAOS client of the build), @POOL@, @MAPPED_USER@.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: multi-pod-test
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: daos-multi-pod
+provisioner: csi.daos.io
+parameters:
+  pool: @POOL@
+  dfuseArgs: "--allow-idmap"
+  rootUid: "0"
+  rootGid: "0"
+  rootMode: "0777" # DFS has no sticky bit
+  acl: "A::@MAPPED_USER@@:rwta"
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared
+  namespace: multi-pod-test
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: daos-multi-pod
+  resources:
+    requests: {storage: 1Gi}
+---
+# uid 1000 in user namespaces of their own
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: writers-a
+  namespace: multi-pod-test
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: writers-a}}
+  template:
+    metadata: {labels: {app: writers-a}}
+    spec:
+      hostUsers: false
+      securityContext: {runAsUser: 1000, runAsGroup: 1000}
+      terminationGracePeriodSeconds: 1
+      containers:
+      - {name: t, image: docker.io/library/busybox:1.37, command: [sleep, "36000"],
+         volumeMounts: [{name: v, mountPath: /data}]}
+      volumes: [{name: v, persistentVolumeClaim: {claimName: shared}}]
+---
+# uid 2000 in user namespaces of their own
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: writers-b
+  namespace: multi-pod-test
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: writers-b}}
+  template:
+    metadata: {labels: {app: writers-b}}
+    spec:
+      hostUsers: false
+      securityContext: {runAsUser: 2000, runAsGroup: 2000}
+      terminationGracePeriodSeconds: 1
+      containers:
+      - {name: t, image: docker.io/library/busybox:1.37, command: [sleep, "36000"],
+         volumeMounts: [{name: v, mountPath: /data}]}
+      volumes: [{name: v, persistentVolumeClaim: {claimName: shared}}]
+---
+# root without a user namespace: sees the owners stored in DAOS
+apiVersion: v1
+kind: Pod
+metadata: {name: viewer, namespace: multi-pod-test}
+spec:
+  terminationGracePeriodSeconds: 1
+  containers:
+  - {name: t, image: docker.io/library/busybox:1.37, command: [sleep, "36000"],
+     volumeMounts: [{name: v, mountPath: /data}]}
+  volumes: [{name: v, persistentVolumeClaim: {claimName: shared}}]
+---
+# interception libraries: root without a user namespace (gets dfuse's handles) ...
+apiVersion: v1
+kind: Pod
+metadata: {name: il-host, namespace: multi-pod-test}
+spec:
+  terminationGracePeriodSeconds: 1
+  containers:
+  - name: t
+    image: @CLIENT_IMAGE@
+    imagePullPolicy: IfNotPresent
+    command: [sleep, "36000"]
+    volumeMounts:
+    - {name: v, mountPath: /data}
+    - {name: agent, mountPath: /var/run/daos_agent}
+  volumes:
+  - {name: v, persistentVolumeClaim: {claimName: shared}}
+  - {name: agent, csi: {driver: csi.daos.io, volumeAttributes: {type: agent-socket}}}
+---
+# ... and root of a user namespace (another uid for dfuse: no handles)
+apiVersion: v1
+kind: Pod
+metadata: {name: il-userns, namespace: multi-pod-test}
+spec:
+  hostUsers: false
+  terminationGracePeriodSeconds: 1
+  containers:
+  - name: t
+    image: @CLIENT_IMAGE@
+    imagePullPolicy: IfNotPresent
+    command: [sleep, "36000"]
+    volumeMounts:
+    - {name: v, mountPath: /data}
+    - {name: agent, mountPath: /var/run/daos_agent}
+  volumes:
+  - {name: v, persistentVolumeClaim: {claimName: shared}}
+  - {name: agent, csi: {driver: csi.daos.io, volumeAttributes: {type: agent-socket}}}
+---
+# a subdirectory of the volume (subPath), user namespace, uid 1000
+apiVersion: v1
+kind: Pod
+metadata: {name: subpath, namespace: multi-pod-test}
+spec:
+  hostUsers: false
+  securityContext: {runAsUser: 1000, runAsGroup: 1000}
+  terminationGracePeriodSeconds: 1
+  containers:
+  - {name: t, image: docker.io/library/busybox:1.37, command: [sleep, "36000"],
+     volumeMounts: [{name: v, mountPath: /data, subPath: sub}]}
+  volumes: [{name: v, persistentVolumeClaim: {claimName: shared}}]
+---
+# the volume read-only, user namespace, uid 1000
+apiVersion: v1
+kind: Pod
+metadata: {name: readonly, namespace: multi-pod-test}
+spec:
+  hostUsers: false
+  securityContext: {runAsUser: 1000, runAsGroup: 1000}
+  terminationGracePeriodSeconds: 1
+  containers:
+  - {name: t, image: docker.io/library/busybox:1.37, command: [sleep, "36000"],
+     volumeMounts: [{name: v, mountPath: /data, readOnly: true}]}
+  volumes: [{name: v, persistentVolumeClaim: {claimName: shared}}]

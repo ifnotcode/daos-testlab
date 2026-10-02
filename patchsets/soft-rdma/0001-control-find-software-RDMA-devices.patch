@@ -1,0 +1,154 @@
+From 41e6db5cd072114fdca81f6bae0f7cb2c68c989e Mon Sep 17 00:00:00 2001
+From: Dmitry Polonsky <ifnotelse@gmail.com>
+Date: Wed, 30 Sep 2026 21:11:54 +0300
+Subject: [PATCH] control: Find software RDMA devices in sysfs
+
+Soft-RoCE (rdma_rxe) and soft-iWARP (siw) devices have no "device" link
+in sysfs, only a "parent" file with the network interface they run on.
+The sysfs topology skipped them, so daos_server and daos_agent found no
+fabric interface for a verbs provider on hosts without RDMA hardware,
+e.g. test VMs.
+
+Give such a device the PCI address and NUMA node of its parent
+interface, so that the fabric scan maps it to that interface as it
+does for RDMA hardware.
+---
+ src/control/lib/hardware/sysfs/provider.go    | 39 ++++++++++++++---
+ .../lib/hardware/sysfs/provider_test.go       | 43 ++++++++++++++++++-
+ 2 files changed, 76 insertions(+), 6 deletions(-)
+
+diff --git a/src/control/lib/hardware/sysfs/provider.go b/src/control/lib/hardware/sysfs/provider.go
+index 7ed420b..c40bb75 100644
+--- a/src/control/lib/hardware/sysfs/provider.go
++++ b/src/control/lib/hardware/sysfs/provider.go
+@@ -1,6 +1,6 @@
+ //
+ // (C) Copyright 2021-2024 Intel Corporation.
+-// (C) Copyright 2025 Hewlett Packard Enterprise Development LP
++// (C) Copyright 2025-2026 Hewlett Packard Enterprise Development LP
+ //
+ // SPDX-License-Identifier: BSD-2-Clause-Patent
+ //
+@@ -164,19 +164,26 @@ func (s *Provider) addPCIDevice(topo *hardware.Topology, subsystem string, path
+ 		return nil
+ 	}
+ 
+-	dev, err := s.getNetworkDevice(path, subsystem)
+-	if err != nil {
++	var dev *hardware.PCIDevice
++	var err error
++	devPath := path
++	if parentPath, found := s.softRDMAParent(path, subsystem); found {
++		// The device belongs to the PCI device and NUMA node of the network interface it
++		// runs on.
++		dev = &hardware.PCIDevice{Name: filepath.Base(path), Type: hardware.DeviceTypeOFIDomain}
++		devPath = parentPath
++	} else if dev, err = s.getNetworkDevice(path, subsystem); err != nil {
+ 		s.log.Tracef(err.Error())
+ 		return nil
+ 	}
+ 
+-	numaID, err := s.getNUMANode(path)
++	numaID, err := s.getNUMANode(devPath)
+ 	if err != nil {
+ 		s.log.Tracef("using default NUMA node, unable to get: %s", err.Error())
+ 		numaID = 0
+ 	}
+ 
+-	pciAddr, err := s.getPCIAddress(path)
++	pciAddr, err := s.getPCIAddress(devPath)
+ 	if err != nil {
+ 		s.log.Trace(err.Error())
+ 		return nil
+@@ -187,6 +194,28 @@ func (s *Provider) addPCIDevice(topo *hardware.Topology, subsystem string, path
+ 	return topo.AddDevice(uint(numaID), dev)
+ }
+ 
++// softRDMAParent returns the sysfs path of the network interface that a software RDMA device, such
++// as Soft-RoCE (rdma_rxe) or soft-iWARP (siw), runs on. Unlike RDMA hardware, such a device has no
++// "device" link, only a "parent" file with the name of that interface.
++func (s *Provider) softRDMAParent(path, subsystem string) (string, bool) {
++	if subsystem != "infiniband" {
++		return "", false
++	}
++	if _, err := os.Stat(filepath.Join(path, "device")); err == nil {
++		return "", false
++	}
++	parent, err := os.ReadFile(filepath.Join(path, "parent"))
++	if err != nil || strings.TrimSpace(string(parent)) == "" {
++		return "", false
++	}
++	parentPath := s.sysPath("class", "net", strings.TrimSpace(string(parent)))
++	if _, err := os.Stat(filepath.Join(parentPath, "device")); err != nil {
++		return "", false
++	}
++	s.log.Tracef("%s: software RDMA device on %s", filepath.Base(path), filepath.Base(parentPath))
++	return parentPath, true
++}
++
+ func (s *Provider) getNetworkDevice(path, subsystem string) (*hardware.PCIDevice, error) {
+ 	// Network devices will have the device/net subdirectory structure
+ 	netDev, err := os.ReadDir(filepath.Join(path, "device", "net"))
+diff --git a/src/control/lib/hardware/sysfs/provider_test.go b/src/control/lib/hardware/sysfs/provider_test.go
+index 791c7de..6dd2c62 100644
+--- a/src/control/lib/hardware/sysfs/provider_test.go
++++ b/src/control/lib/hardware/sysfs/provider_test.go
+@@ -1,6 +1,6 @@
+ //
+ // (C) Copyright 2021-2024 Intel Corporation.
+-// (C) Copyright 2025 Hewlett Packard Enterprise Development LP
++// (C) Copyright 2025-2026 Hewlett Packard Enterprise Development LP
+ //
+ // SPDX-License-Identifier: BSD-2-Clause-Patent
+ //
+@@ -331,6 +331,47 @@ func TestProvider_GetTopology(t *testing.T) {
+ 			p:         &Provider{},
+ 			expResult: &hardware.Topology{},
+ 		},
++		"software RDMA device": {
++			setup: func(t *testing.T, root string) {
++				path := setupPCIDev(t, root, validPCIAddr, "net", "net0")
++				setupNUMANode(t, path, "2\n")
++				setupClassLink(t, root, "net", path)
++
++				// Soft-RoCE: no "device" link, only the name of the interface it runs on
++				rxePath := filepath.Join(root, "devices", "virtual", "infiniband", "rxe0")
++				if err := os.MkdirAll(rxePath, 0755); err != nil {
++					t.Fatal(err)
++				}
++				writeTestFile(t, filepath.Join(rxePath, "parent"), "net0\n")
++				setupClassLink(t, root, "infiniband", rxePath)
++
++				// without a parent interface it is not in the topology
++				orphanPath := filepath.Join(root, "devices", "virtual", "infiniband", "rxe1")
++				if err := os.MkdirAll(orphanPath, 0755); err != nil {
++					t.Fatal(err)
++				}
++				writeTestFile(t, filepath.Join(orphanPath, "parent"), "missing0\n")
++				setupClassLink(t, root, "infiniband", orphanPath)
++			},
++			p: &Provider{},
++			expResult: &hardware.Topology{
++				NUMANodes: hardware.NodeMap{
++					2: hardware.MockNUMANode(2, 0).
++						WithDevices([]*hardware.PCIDevice{
++							{
++								Name:    "rxe0",
++								Type:    hardware.DeviceTypeOFIDomain,
++								PCIAddr: *hardware.MustNewPCIAddress(validPCIAddr),
++							},
++							{
++								Name:    "net0",
++								Type:    hardware.DeviceTypeNetInterface,
++								PCIAddr: *hardware.MustNewPCIAddress(validPCIAddr),
++							},
++						}),
++				},
++			},
++		},
+ 		"net device only": {
+ 			setup: func(t *testing.T, root string) {
+ 				path := setupPCIDev(t, root, validPCIAddr, "net", "net0")
+-- 
+2.39.5 (Apple Git-154)
+

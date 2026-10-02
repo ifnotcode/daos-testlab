@@ -1,0 +1,11 @@
+# EL9 image with the DAOS client of a lab build (base for the CSI driver image and for test pods).
+# Build context: a directory with the build's RPMs in ./rpms
+FROM docker.io/library/almalinux:9
+COPY rpms/ /tmp/rpms/
+# priority=1: the build's versions win over EPEL/AppStream (e.g. libfabric)
+RUN dnf -y install epel-release createrepo_c && dnf config-manager --set-enabled crb && \
+    createrepo_c -q /tmp/rpms && \
+    printf '[local]\nname=local\nbaseurl=file:///tmp/rpms\ngpgcheck=0\npriority=1\n' \
+        > /etc/yum.repos.d/local.repo && \
+    dnf -y install daos-client daos-admin fuse3 && \
+    rm -rf /tmp/rpms /etc/yum.repos.d/local.repo && dnf clean all
