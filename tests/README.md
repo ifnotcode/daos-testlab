@@ -29,6 +29,7 @@ bin/lab test dfuse-idmap client-1 DAOS_PREFIX=/opt/daos
 | `k8s-mlcore-csi` | k8s | Драйвер коллег (`mlcore.daos.csi`): `VARIANT=orig\|fixed IMAGE=<образ>`. Агент DAOS даёт `lab csi` |
 | `k8s-rdma` | k8s в `profiles/rdma.conf` | провайдер verbs, `lab csi`; `CLIENT_IMAGE=@<build>` |
 | `ftest` | ft-client (`profiles/ftest.conf`) | сборка и тестовые пакеты на обоих узлах профиля, см. ниже |
+| `dscan` | client | сервер DAOS 2.8; исходники dscan кладёт `scripts/lab-test.sh` из репозитория dscan (набор живёт там, в `lab/tests/dscan.sh`), `UNIT_ONLY=1` не трогает пул |
 
 ## Общие переменные
 
