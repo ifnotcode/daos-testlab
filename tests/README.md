@@ -27,9 +27,11 @@ bin/lab test dfuse-idmap client-1 DAOS_PREFIX=/opt/daos
 | `k8s-csi-resources` | k8s | `lab csi <vm> <image>` с образом csi-daos, где есть ресурсы mount-подов (`-r7` для всех проверок) |
 | `k8s-csi-health` | k8s | `lab csi <vm> <image>` с образом csi-daos с проверками здоровья (`-r7` и новее) |
 | `k8s-mlcore-csi` | k8s | Драйвер коллег (`mlcore.daos.csi`): `VARIANT=orig\|fixed IMAGE=<образ>`. Агент DAOS даёт `lab csi` |
+| `k8s-ml-test` | talos в `profiles/ml_test.conf` | образ их драйвера в реестре стенда: `VARIANT=orig IMAGE=@mlcore-csi:orig-v2.8.0` или `VARIANT=fixed IMAGE=@mlcore-csi:fixed-v2.8.0-r2` |
+| `k8s-ml-supervisor` | talos в `profiles/ml_test.conf` | супервизор коллег (MLP-15629) и их драйвер в режиме supervisor: `SUP=orig\|fixed SUP_TAG=<образ mount-supervisor> IMAGE=@mlcore-csi:fixed-v2.8.0-sup-r1`. Volcano ставится сам |
 | `k8s-rdma` | k8s в `profiles/rdma.conf` | провайдер verbs, `lab csi`; `CLIENT_IMAGE=@<build>` |
 | `ftest` | ft-client (`profiles/ftest.conf`) | сборка и тестовые пакеты на обоих узлах профиля, см. ниже |
-| `dscan` | client | сервер DAOS 2.8; исходники dscan кладёт `scripts/lab-test.sh` из репозитория dscan (набор живёт там, в `lab/tests/dscan.sh`), `UNIT_ONLY=1` не трогает пул |
+| `dscan` | client-2 (стоковый DAOS 2.8) | сервер DAOS 2.8; запускать `scripts/lab-test.sh` из репозитория dscan: он кладёт на VM исходники и сам набор (набор живёт там, в `lab/tests/dscan.sh`), `UNIT_ONLY=1` не трогает пул |
 
 ## Общие переменные
 
@@ -261,3 +263,44 @@ CSI-драйвер коллег (`DaosInmapPatch/colleagues-csi`) в тех сл
 - API-сервер отклоняет `hostUsers: false` вместе с `hostNetwork`;
 - под с `hostUsers: false` пишет и читает 64 MiB через том dfuse с `--allow-idmap`. dfuse работает
   по verbs в mount-поде, так что для такого пода это единственный путь к DAOS по RDMA.
+
+### k8s-ml-test
+Повторяет стенд коллег ml_test по данным обследования (`docs/cluster-survey/part2`) и проверяет
+перезапуск их CSI-драйвера. Только kubectl, поэтому работает и с Talos.
+
+Что поднимается:
+- агент DAOS — DaemonSet в `daos-client` (privileged, `hostPID`, `nobody:nobody`);
+- их драйвер в `daos-csi-driver`;
+- статический PV `daos-fast-pv-ml-core-test-38`;
+- под `test-daos-client`: `hostUsers: false`, uid 1234.
+
+Порядок проверок:
+1. idmapped-том, запись от uid 1234, dfuse с `--allow-idmap`.
+2. Драйвер не перезапускается сам по liveness.
+3. Удаление пода драйвера: остался ли dfuse и читается ли том.
+4. Пересоздание пода.
+
+### k8s-ml-supervisor
+Тот же стенд ml_test, но dfuse запускается так, как коллеги планируют (MLP-15629). Их драйвер в
+режиме `dfuse.mountMode: supervisor` вызывает daos-mount-supervisor через unix-сокет, а супервизор
+запускает по Volcano job на staging-путь, и в нём работает dfuse. Код, патчи и сборка образов —
+`DaosInmapPatch/colleagues-csi/mount-supervisor` (`FIXES.md`, `lab/build.sh`).
+
+Что поднимается:
+- Volcano v1.15.3 (один раз; образы — в реестре стенда, установщик — в
+  `/mnt/keenetic/daos-testlab/cache/volcano`);
+- агент, PV и под — как в `k8s-ml-test`;
+- супервизор: `k8s/mlcore/supervisor-<SUP>.yaml` — их chart, отрендеренный с `lab/values.lab.yaml`;
+- драйвер: `k8s/mlcore/supervisor-driver.yaml`.
+
+Порядок проверок:
+1. Один mount job: Running, под Ready, hostNetwork; на узле `fuse.daos`; dfuse с `--foreground --allow-idmap`.
+2. idmapped-том в поде с `hostUsers: false`, запись от uid 1234.
+3. Перезапуск драйвера, затем супервизора: тот же dfuse, том читается.
+4. PV с `mountOptions: rw`: отказ без job-а.
+5. API напрямую (`supctl` в образе): путь `/etc` и `--mountpoint` отвергнуты.
+6. `kill -9` dfuse: ENOTCONN, job Failed; Unmount через API снимает job и мёртвое монтирование. Пересоздание пода: новый job, том читается.
+7. Удаление пода: job удалён, staging-путь свободен.
+
+`SUP=fixed SUP_TAG=fixed-r4` — 31 из 31 (25.10.2026).
+

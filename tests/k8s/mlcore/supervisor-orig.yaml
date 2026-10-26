@@ -1,0 +1,263 @@
+---
+# Source: daos-mount-supervisor/templates/rbac.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: daos-mount-supervisor-sa
+  namespace: daos-mount-supervisor
+---
+# Source: daos-mount-supervisor/templates/rbac.yaml
+# Dedicated SA for mount-job pods (service.mountJob.pod.serviceAccount). Mount
+# jobs run in the supervisor's own namespace (default), so the SA is created
+# here; add role/bindings for it if the dfuse mounter needs extra permissions.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: daos-fuse-mount-job-sa
+  namespace: daos-mount-supervisor
+---
+# Source: daos-mount-supervisor/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: daos-mount-supervisor-config
+  namespace: daos-mount-supervisor
+data:
+  config.yaml: |
+    # Values are operator-friendly lowercase; this template maps them onto the
+    # ml-core-utils key casing (SageSystem, Logger, …) that config.go parses.
+    telemetry:
+      logger:
+        SageSystem: data-proxy
+        ServiceName: daos-mount-supervisor
+        SageGroup: ml_platform_core
+        K8sCluster: "lab"
+        AppEnv: dev
+        AppVersion: SUP_TAG
+        Logger:
+          Level: debug
+      tracing:
+        TenantName: "ai-platform"
+        ServiceName: daos-mount-supervisor
+        SageSystem: data-proxy
+        SageGroup: ml_platform_core
+        K8sCluster: "lab"
+        K8sNamespace: daos-mount-supervisor
+        AppEnv: dev
+        AppVersion: SUP_TAG
+        Tracer:
+          CollectorEndpoint: ""
+          SampleRatio: 1
+      metrics:
+        path: /metrics
+        port: 61111
+        env: dev
+        namespace: daos_mount_supervisor
+        version: SUP_TAG
+      pprof:
+        enable: false
+        port: 6062
+    health:
+      port: 65080
+      livenessPath: /healthz
+      readinessPath: /readyz
+    mountJob:
+      namespace: daos-mount-supervisor
+      queue: daos-fuse-mount-jobs
+      priorityClassName: system-node-critical
+      maxRetry: 1
+      supervisorLabel: mlcore.t-tech.team/fuse-supervisor
+      nodeHashLabel: mlcore.t-tech.team/fuse-node-hash
+      pod:
+        image: SUP_REGISTRY/mount-supervisor:SUP_TAG
+        command: 
+          - /opt/daos/bin/dfuse
+        resources: 
+          limits:
+            cpu: 1000m
+            memory: 4Gi
+          requests:
+            cpu: 1000m
+            memory: 4Gi
+        securityContext: 
+          {}
+        containerSecurityContext: 
+          allowPrivilegeEscalation: true
+          capabilities:
+            add:
+            - SYS_ADMIN
+          privileged: true
+        serviceAccount: daos-fuse-mount-job-sa
+        tolerations: 
+          []
+        commonLabels: 
+          {}
+        hostPID: false
+        mountPropagation: Bidirectional
+        devFusePath: /dev/fuse
+        daosAgentPath: /var/run/daos_agent
+        daosAgentContainerPath: /var/run/daos_agent
+        daosCliPath: /opt/daos/bin
+        env: 
+          []
+    daos:
+      cache:
+        size: 1024
+        ttl: 30s
+      cliPath: /opt/daos/bin/daos
+    mountTable:
+      cache:
+        size: 1024
+        ttl: 30s
+      dfuseFSTypes:
+      - fuse.daos
+      - fuse
+      - fuse.dfuse
+      mountInfoPath: /proc/1/mountinfo
+    grpcServer:
+      socketPath: /run/daos-mount-supervisor/daos-mount-supervisor.sock
+      shutdownTimeout: 30s
+---
+# Source: daos-mount-supervisor/templates/rbac.yaml
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: daos-mount-supervisor-role
+rules:
+  # Volcano mount jobs CRUD + watch (KubernetesRepository).
+  - apiGroups: ["batch.volcano.sh"]
+    resources: ["jobs"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+  # corev1 Pods read/watch for readiness resolution.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+# Source: daos-mount-supervisor/templates/rbac.yaml
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: daos-mount-supervisor-rolebind
+subjects:
+  - kind: ServiceAccount
+    name: daos-mount-supervisor-sa
+    namespace: daos-mount-supervisor
+roleRef:
+  kind: ClusterRole
+  name: daos-mount-supervisor-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# Source: daos-mount-supervisor/templates/daemonset.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: daos-mount-supervisor
+  namespace: daos-mount-supervisor
+  labels:
+    app: daos-mount-supervisor
+    release: daos-mount-supervisor
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 50%
+  selector:
+    matchLabels:
+      app: daos-mount-supervisor
+      release: daos-mount-supervisor
+  template:
+    metadata:
+      labels:
+        app: daos-mount-supervisor
+        release: daos-mount-supervisor
+        sage/group: "ml_platform_core"
+      annotations:
+        ru.tcsbank.ml-core/system: "data-proxy"
+        ru.tcsbank.ml-core/service_name: "daos-mount-supervisor"
+        ru.tcsbank.ml-core/logs: enabled
+        ru.tcsbank.ml-core/env: "dev"
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "61111"
+    spec:
+      hostPID: true
+      serviceAccountName: daos-mount-supervisor-sa
+      imagePullSecrets:
+        []
+      tolerations:
+      containers:
+        - name: supervisor
+          image: SUP_REGISTRY/mount-supervisor:SUP_TAG
+          imagePullPolicy: IfNotPresent
+          command: ["/app/daos-mount-supervisor"]
+          args:
+            - -config
+            - /etc/config/config.yaml
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN"]
+            allowPrivilegeEscalation: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 65080
+            initialDelaySeconds: 25
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 65080
+            initialDelaySeconds: 25
+            periodSeconds: 5
+          ports:
+            - name: metrics
+              containerPort: 61111
+            - name: pprof
+              containerPort: 6062
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: driver-config
+              mountPath: /etc/config
+              readOnly: true
+            - name: daos-sock
+              mountPath: /var/run/daos_agent
+              readOnly: true
+            - name: grpc-sock
+              mountPath: /run/daos-mount-supervisor
+          resources:
+            limits:
+              cpu: 100m
+              memory: 256Mi
+            requests:
+              cpu: 50m
+              memory: 128Mi
+      volumes:
+        - name: driver-config
+          configMap:
+            name: daos-mount-supervisor-config
+        - name: daos-sock
+          hostPath:
+            path: /var/run/daos_agent
+            type: DirectoryOrCreate
+        - name: grpc-sock
+          hostPath:
+            path: /run/daos-mount-supervisor
+            type: DirectoryOrCreate
+---
+# Source: daos-mount-supervisor/templates/queue.yaml
+# Volcano queue the supervisor submits mount jobs to. Cluster-scoped resource
+# (no namespace): the name defaults to service.mountJob.queue so job submissions
+# and the queue always match. Disable via queue.enabled when a cluster-wide
+# queue already exists.
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: Queue
+metadata:
+  name: daos-fuse-mount-jobs
+spec:
+  weight: 1
+  reclaimable: true

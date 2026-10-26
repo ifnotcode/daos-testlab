@@ -1,0 +1,38 @@
+
+## context
+hostname: test-daos-client
+node kernel (uname -r): 6.18.42-talos
+id: uid=1234 gid=1234 groups=1234
+uid_map:  0 3701211136 65536
+gid_map:  0 3701211136 65536
+container OS: Ubuntu 22.04.5 LTS
+sees the node's processes (hostPID): no
+
+## mounts that look like DAOS / FUSE
+15137 15130 0:568 / /mnt/daos rw,nosuid,nodev,noatime,idmapped - fuse.daos dfuse rw,user_id=0,group_id=0,default_permissions,allow_other
+15159 15130 0:38 /daos_agent /var/run/daos_agent ro,nosuid,noexec,relatime,idmapped - tmpfs none rw,seclabel,mode=755
+--- /mnt/daos
+ls: cannot access '/mnt/daos': Transport endpoint is not connected
+ls: cannot access '/mnt/daos': Transport endpoint is not connected
+--- /var/run/daos_agent
+fs type: tmpfs
+drwxr-xr-x. 2 0 0 60 Sep 30 13:25 /var/run/daos_agent
+total 0
+srw-rw-rw-. 1 0 0 0 Sep 30 13:25 daos_agent.sock
+--- "idmapped" in the mount options: the volume is an idmapped mount (user namespace).
+--- a volume that is not fuse.daos here (e.g. ext4/xfs/overlay) is not served by dfuse
+
+## DAOS client in this image
+/daos/install/bin/dfuse: /daos/install/bin/dfuse version 2.8.0, libdaos 2.8.0 Using fuse 1.0.0 Kernel readdir support enabled 
+  patch messages: none
+  knows --allow-idmap: 0
+0
+daos: DAOS CLI version 2.8.0, libdaos v2.8.0
+daos_agent: DAOS Agent version 2.8.0
+total 0
+srw-rw-rw-. 1 root root 0 Sep 30 13:25 daos_agent.sock
+
+## dfuse processes visible from here
+none (without hostPID only this pod's own processes are visible)
+
+probe done

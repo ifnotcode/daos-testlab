@@ -1,0 +1,127 @@
+
+## context
+hostname: ix-m3-sm15-cz2d290ggy
+node kernel (uname -r): 6.18.42-talos
+id: uid=0(root) gid=0(root) groups=0(root)
+uid_map:  0 0 4294967295
+gid_map:  0 0 4294967295
+container OS: Ubuntu 22.04.5 LTS
+sees the node's processes (hostPID): yes
+
+## mounts that look like DAOS / FUSE
+7536 7529 8:4 /lib/kubelet/pods/a364d786-0bc5-46e7-9479-66eee151c4b2/volumes/kubernetes.io~configmap/config/..2026_09_30_13_25_16.943428755/daos-agent.yaml//deleted /etc/daos-agent.yaml ro,relatime - xfs /dev/sda4 rw,seclabel,inode64,logbufs=8,logbsize=32k,sunit=128,swidth=128,noquota
+7538 7531 8:4 /lib/kubelet/pods/a364d786-0bc5-46e7-9479-66eee151c4b2/containers/daos-agent/01f4fd97 /dev/termination-log rw,relatime - xfs /dev/sda4 rw,seclabel,inode64,logbufs=8,logbsize=32k,sunit=128,swidth=128,noquota
+7543 7529 0:38 /daos_agent /var/run/daos_agent rw,relatime - tmpfs none rw,seclabel,mode=755
+--- /dev/termination-log
+fs type: xfs
+-rw-rw-rw-. 1 0 0 0 Sep 30 13:25 /dev/termination-log
+-rw-rw-rw-. 1 0 0 0 Sep 30 13:25 /dev/termination-log
+--- /etc/daos-agent.yaml
+fs type: xfs
+-rw-r--r--. 0 0 0 281 Sep 30 13:25 /etc/daos-agent.yaml
+-rw-r--r--. 0 0 0 281 Sep 30 13:25 /etc/daos-agent.yaml
+--- /var/run/daos_agent
+fs type: tmpfs
+drwxr-xr-x. 2 0 0 60 Sep 30 13:25 /var/run/daos_agent
+total 0
+srw-rw-rw-. 1 0 0 0 Sep 30 13:25 daos_agent.sock
+--- "idmapped" in the mount options: the volume is an idmapped mount (user namespace).
+--- a volume that is not fuse.daos here (e.g. ext4/xfs/overlay) is not served by dfuse
+
+## DAOS client in this image
+/opt/daos/bin/dfuse: /opt/daos/bin/dfuse version 2.9.100, libdaos 2.8.0 Using fuse 1.1.0 Kernel readdir support enabled 
+  patch messages: Idmapped mounts allowed
+                  Kernel does not support idmapped mounts
+  knows --allow-idmap: 1
+daos: DAOS CLI version 2.9.100, libdaos v2.8.0
+daos_agent: DAOS Agent version 2.9.100
+/opt/daos/lib64/libioil.so
+/opt/daos/lib64/libpil4dfs.so
+total 0
+srw-rw-rw-. 1 root root 0 Sep 30 13:25 daos_agent.sock
+
+## dfuse processes visible from here
+none (without hostPID only this pod's own processes are visible)
+
+## node network (hostNetwork pods see the node's interfaces)
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 26636850124 218884511    0    0    0     0          0         0 26636850124 218884511    0    0    0     0       0          0
+ bond0:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0
+dummy0:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0
+ teql0:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0
+ tunl0:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0
+  sit0:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0
+ip6tnl0:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0
+  eth0:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0
+  eth1:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0
+  eth2:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0
+  eth3:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0
+  eth4: 1161598850205 612167751    0    0    0     0          0         2 528025477625 563030698    0    3    0     0       0          0
+  eth5: 591937291382 349164018    0    0    0     0          0         3 2272257479821 1452098048    0    0    0     0       0          0
+   ib0:       0       0    0    0    0     0          0         0        0       0    0   30    0     0       0          0
+   ib1:  229928    2110    0    0    0     0          0         0    82704    1186    0    0    0     0       0          0
+dummy-bgp:       0       0    0    0    0     0          0         0  1395984   18805    0    0    0     0       0          0
+dummy-host:       0       0    0    0    0     0          0         0      280       4    0    0    0     0       0          0
+siderolink: 87185312  820296    0    0    0     0          0         0 97347320  828603    0  547    0     0       0          0
+cilium_net:     510       5    0    0    0     0          0         0    69040     984    0    0    0     0       0          0
+cilium_host:   69040     984    0    0    0     0          0         0      510       5    0    0    0     0       0          0
+lxcd01a722a7be7: 5819533663 10611923    0    0    0     0          0         0 54953315  644265    0    0    0     0       0          0
+lxc3db5fe6819da: 2779362922 20095145    0    0    0     0          0         0 1763129774 19614313    0    0    0     0       0          0
+lxc36667f1c191f: 643785716 4751625    0    0    0     0          0         0 316961571 3566767    0    0    0     0       0          0
+lxcb3e43052656e: 36246165  426221    0    0    0     0          0         0  1743154   41501    0    0    0     0       0          0
+lxcce91afb2a170: 29318950  162242    0    0    0     0          0         0     5906     139    0    0    0     0       0          0
+lxc7ad65f435047: 6724433362 6497531    0    0    0     0          0         0 856558282 6614221    0    0    0     0       0          0
+lxc01484f457488: 760472456  654370    0    0    0     0          0         0 19279423  252336    0    0    0     0       0          0
+lxc5a2f7fe279e1: 441486176    9096    0    0    0     0          0         0     2056      17    0    0    0     0       0          0
+lxc508958c4f041: 55963661  428787    0    0    0     0          0         0 16397040   97305    0    0    0     0       0          0
+lxc26b57b7708f7: 1643670617 2584390    0    0    0     0          0         0 45670242  517286    0    0    0     0       0          0
+lxc9f24a1f9b41e: 41787249  329060    0    0    0     0          0         0 12158796   73489    0    0    0     0       0          0
+lxc692b8082225a: 400073738 2212807    0    0    0     0          0         0 194618789 2179148    0    0    0     0       0          0
+lxcee21f949634b: 729621579 2878367    0    0    0     0          0         0 247746954 2696226    0    0    0     0       0          0
+lxcd181a3db6290: 2851326817 2358028    0    0    0     0          0         0 44765418  540193    0    0    0     0       0          0
+lxc62937e8d5c4d: 29364842654 16413388    0    0    0     0          0         0 589983340 3380807    0    0    0     0       0          0
+lxcc121159c303b: 406780488 1128175    0    0    0     0          0         0 276421876 1295205    0    0    0     0       0          0
+lxc7d525134af24: 2179862798 3376733    0    0    0     0          0         0 50620870  573892    0    0    0     0       0          0
+lxcce2b4345480a: 406569539 1127759    0    0    0     0          0         0 276155801 1291327    0    0    0     0       0          0
+lxc1de60b193608: 462446112 2655455    0    0    0     0          0         0 178690175 1993169    0    0    0     0       0          0
+lxc709efaaf2615: 1108981167 2475270    0    0    0     0          0         0 71247417  798384    0    0    0     0       0          0
+lxcbfc74a55bdbe: 150562689354 40512119    0    0    0     0          0         0 40647586  483469    0    0    0     0       0          0
+lxc740742ab91dd: 635224520 2174309    0    0    0     0          0         0 183241878 2008331    0    0    0     0       0          0
+lxc3a6e3f918150: 422283999 2304528    0    0    0     0          0         0 179977480 1992191    0    0    0     0       0          0
+lxc29ccb5936ca6:  686039    9936    0    0    0     0          0         0    65252    1552    0    0    0     0       0          0
+lxcc8f2e1ec4fb7: 806222559 1957746    0    0    0     0          0         0 49962743  561770    0    0    0     0       0          0
+lxc8e5dcb17a31c: 238318039 2466107    0    0    0     0          0         0 150931729 1713293    0    0    0     0       0          0
+lxc7aa3b4d54220: 154904526 1616199    0    0    0     0          0         0 149589044 1685230    0    0    0     0       0          0
+lxccecacd788cbc: 350690142 1314741    0    0    0     0          0         0 107045843 1164448    0    0    0     0       0          0
+lxc788464b1ad22: 172558555  953415    0    0    0     0          0         0 83833908  938433    0    0    0     0       0          0
+lxcac2f794223c1: 175349897  953944    0    0    0     0          0         0 83350431  931051    0    0    0     0       0          0
+lxce70360818a46: 601454603 1798256    0    0    0     0          0         0 85905840  964765    0    0    0     0       0          0
+lxcf4236db7acf7: 318358342 1092990    0    0    0     0          0         0 83624284  935258    0    0    0     0       0          0
+lxc26553e738e1d: 439130663 1133609    0    0    0     0          0         0 87716261  991635    0    0    0     0       0          0
+lxc313ee734ec58: 534438799 3252890    0    0    0     0          0         0 88668835  997091    0    0    0     0       0          0
+lxcdaa4c829e9e5: 594015901 1342361    0    0    0     0          0         0 33417853  378507    0    0    0     0       0          0
+lxcb07cbcffe9f3: 322763296 1115970    0    0    0     0          0         0 85785862  968002    0    0    0     0       0          0
+lxcb63971a477ca: 260561801 1003504    0    0    0     0          0         0 88567754  998951    0    0    0     0       0          0
+lxcb1fa0869f66f: 416402808 1023565    0    0    0     0          0         0 86142201  973148    0    0    0     0       0          0
+lxc06232cdea44c: 774009830  729800    0    0    0     0          0         0 21928177  247550    0    0    0     0       0          0
+lxc9a79cce4087d: 188353363  974550    0    0    0     0          0         0 86629662  980798    0    0    0     0       0          0
+lxcac76bf15d0fc: 654659135 1216590    0    0    0     0          0         0 93970437 1035872    0    0    0     0       0          0
+lxc6c7b40858ead: 190226197  998836    0    0    0     0          0         0 85279318  960339    0    0    0     0       0          0
+lxc2fcbcfee8179: 190308142  999351    0    0    0     0          0         0 84952232  955399    0    0    0     0       0          0
+lxcd263419770c6: 576357362 1728760    0    0    0     0          0         0 86585992  980128    0    0    0     0       0          0
+lxc091946afea4a: 278355727 1207336    0    0    0     0          0         0 110785654 1221877    0    0    0     0       0          0
+lxce373bf78b65b: 258875121  123353    0    0    0     0          0         0      442       6    0    0    0     0       0          0
+lxc230689e808b3: 191137988  332255    0    0    0     0          0         0    17728      77    0    0    0     0       0          0
+lxcef3a58520743: 860268931 7616887    0    0    0     0          0         0 83275166  930144    0    0    0     0       0          0
+lxcf14b52c67dd4: 113930702  199199    0    0    0     0          0         0    15893      69    0    0    0     0       0          0
+lxc705fe05bbaa4: 112850720  197355    0    0    0     0          0         0    15979      70    0    0    0     0       0          0
+lxc3d0de294025a: 86108266  282961    0    0    0     0          0         0  6234341   71237    0    0    0     0       0          0
+lxc7737fce03726: 29393832   51886    0    0    0     0          0         0    14194      61    0    0    0     0       0          0
+mlx5_0
+mlx5_1
+mlx5_2
+mlx5_3
+(RDMA devices above)
+
+probe done

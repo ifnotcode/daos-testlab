@@ -56,8 +56,10 @@ for p in "$(dirname "$0")"/../talos/patches/*.yaml.in; do
 	sed -e "s|@REGISTRY@|$REGISTRY|g" -e "s|@TALOS_POD_CIDR@|$TALOS_POD_CIDR|g" "$p" >"$out"
 	patches+=(--config-patch "@$out")
 done
+k8s_version=()
+[ -n "${TALOS_K8S_VERSION:-}" ] && k8s_version=(--kubernetes-version "$TALOS_K8S_VERSION")
 "$talosctl" gen config "$TALOS_CLUSTER" "https://$ip:6443" --with-secrets "$dir/secrets.yaml" \
-	--install-image "factory.talos.dev/nocloud-installer/$id:$TALOS_VERSION" "${patches[@]}" \
+	"${k8s_version[@]}" --install-image "factory.talos.dev/nocloud-installer/$id:$TALOS_VERSION" "${patches[@]}" \
 	--output-types controlplane,talosconfig -o "$dir" --force >/dev/null
 "$talosctl" validate --config "$dir/controlplane.yaml" --mode cloud >/dev/null
 export TALOSCONFIG=$dir/talosconfig
